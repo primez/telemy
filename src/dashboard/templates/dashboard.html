@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ .Title }}</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.7.1/dist/chart.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        {{template "header" .}}
+        
+        <main>
+            <h2>{{if eq .View "overview"}}Overview{{else if eq .View "metrics"}}Metrics{{else if eq .View "logs"}}Logs{{else if eq .View "traces"}}Traces{{else}}{{.View}}{{end}}</h2>
+            
+            <div class="widgets">
+                {{range .Widgets}}
+                {{if or (eq $.View "overview") (eq $.View .DataSource)}}
+                <div class="widget" data-id="{{.Title}}" data-type="{{.Type}}" data-source="{{.DataSource}}">
+                    <div class="widget-header">
+                        <h3>{{.Title}}</h3>
+                        <div class="widget-controls">
+                            <button class="refresh-btn" title="Refresh">↻</button>
+                        </div>
+                    </div>
+                    <div class="widget-content">
+                        {{if eq .Type "graph"}}
+                        <canvas class="chart"></canvas>
+                        {{else if eq .Type "table"}}
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Time</th>
+                                        <th>Message</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td colspan="2">Loading...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        {{end}}
+                    </div>
+                </div>
+                {{end}}
+                {{end}}
+            </div>
+        </main>
+        
+        {{template "footer" .}}
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html> 

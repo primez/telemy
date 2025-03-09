@@ -1,0 +1,12 @@
+{{define "header"}}
+<header>
+    <h1>Telemy Dashboard</h1>
+    <nav>
+        <ul>
+            {{range .NavLinks}}
+            <li><a href="{{.url}}" {{if eq $.View (index (split .url "/") 2)}}class="active"{{end}}>{{.name}}</a></li>
+            {{end}}
+        </ul>
+    </nav>
+</header>
+{{end}} 

@@ -1,0 +1,18 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Technical stack
+
+- Go (Golang)
+- TSDB (data storage)
+- gRPC
+- HTTP (net/http)
+- JSON (encoding/json)
+- Windows Service (golang.org/x/sys/windows/svc)
+- Chart.js (or an equivalent web visualization library)
+- SMTP (net/smtp)
+- OpenTelemetry Go SDK
+- Git
+- Go unit-testing package

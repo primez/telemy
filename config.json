@@ -1,0 +1,110 @@
+{
+  "service": {
+    "name": "TelemyService",
+    "port": 8080,
+    "protocols": ["http", "grpc"],
+    "logLevel": "info"
+  },
+  "ingestion": {
+    "otlp": {
+      "httpEndpoint": "0.0.0.0:4318",
+      "grpcEndpoint": "0.0.0.0:4317"
+    }
+  },
+  "storage": {
+    "metrics": {
+      "engine": "tsdb",
+      "dataPath": "./data/tsdb_metrics",
+      "retentionPeriod": "30d",
+      "indexConfig": {
+        "blockSize": "2h",
+        "compaction": true
+      }
+    },
+    "logs": {
+      "engine": "badger",
+      "dataPath": "./data/badger_logs",
+      "indexing": true,
+      "maxFileSizeMB": 100
+    },
+    "traces": {
+      "engine": "tsdb",
+      "dataPath": "./data/tsdb_traces",
+      "retentionPeriod": "7d"
+    }
+  },
+  "dashboard": {
+    "defaultView": "overview",
+    "widgets": [
+      {
+        "type": "graph",
+        "title": "CPU Usage",
+        "dataSource": "metrics",
+        "query": "__name__=cpu_usage",
+        "refreshInterval": "30s"
+      },
+      {
+        "type": "graph",
+        "title": "Memory Usage",
+        "dataSource": "metrics",
+        "query": "__name__=memory_usage",
+        "refreshInterval": "30s"
+      },
+      {
+        "type": "table",
+        "title": "Recent Errors",
+        "dataSource": "logs",
+        "query": "level=ERROR",
+        "refreshInterval": "30s",
+        "maxRows": 50
+      },
+      {
+        "type": "table",
+        "title": "Recent Traces",
+        "dataSource": "traces",
+        "query": "",
+        "refreshInterval": "30s",
+        "maxRows": 20
+      }
+    ]
+  },
+  "aggregation": {
+    "functions": ["sum", "avg", "min", "max", "count"],
+    "customAggregations": [
+      {
+        "name": "error_rate",
+        "expression": "count(level=ERROR) / count(*)"
+      }
+    ]
+  },
+  "alerts": {
+    "email": {
+      "enabled": true,
+      "smtpServer": "smtp.example.com",
+      "smtpPort": 587,
+      "username": "alerts@example.com",
+      "password": "your-password",
+      "fromAddress": "alerts@example.com",
+      "toAddresses": ["ops@example.com"],
+      "templates": {
+        "default": "Alert: {alertName} triggered at {timestamp}. Details: {details}"
+      }
+    },
+    "rules": [
+      {
+        "name": "HighCPUUsage",
+        "dataSource": "metrics",
+        "query": "__name__=cpu_usage > 80",
+        "duration": "5m",
+        "severity": "critical"
+      },
+      {
+        "name": "HighErrorRate",
+        "dataSource": "logs",
+        "query": "level=ERROR",
+        "duration": "10m",
+        "severity": "warning"
+      }
+    ]
+  }
+} 
