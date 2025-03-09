@@ -66,7 +66,7 @@ func sendMetrics(stopChan <-chan struct{}) {
 			cpuValue := rnd.Float64() * 100
 			memoryValue := 100 + rnd.Float64()*900
 
-			// Create metrics payload
+			// Create metrics payload with lowerCamelCase field names
 			payload := map[string]interface{}{
 				"resourceMetrics": []map[string]interface{}{
 					{
@@ -136,8 +136,13 @@ func sendMetrics(stopChan <-chan struct{}) {
 				},
 			}
 
+			// Add Content-Type header for JSON format
+			headers := map[string]string{
+				"Content-Type": "application/json",
+			}
+
 			// Send metrics
-			err := sendJSON(metricsEndpoint, payload)
+			err := sendJSON(metricsEndpoint, payload, headers)
 			if err != nil {
 				log.Printf("Error sending metrics: %v", err)
 			} else {
@@ -182,7 +187,7 @@ func sendLogs(stopChan <-chan struct{}) {
 			level := logLevels[rnd.Intn(len(logLevels))]
 			message := logMessages[rnd.Intn(len(logMessages))]
 
-			// Create logs payload
+			// Create logs payload with lowerCamelCase field names
 			payload := map[string]interface{}{
 				"resourceLogs": []map[string]interface{}{
 					{
@@ -226,8 +231,13 @@ func sendLogs(stopChan <-chan struct{}) {
 				},
 			}
 
+			// Add Content-Type header for JSON format
+			headers := map[string]string{
+				"Content-Type": "application/json",
+			}
+
 			// Send logs
-			err := sendJSON(logsEndpoint, payload)
+			err := sendJSON(logsEndpoint, payload, headers)
 			if err != nil {
 				log.Printf("Error sending logs: %v", err)
 			} else {
@@ -306,7 +316,7 @@ func sendTraces(stopChan <-chan struct{}) {
 				}
 			}
 
-			// Create traces payload
+			// Create traces payload with lowerCamelCase field names
 			payload := map[string]interface{}{
 				"resourceSpans": []map[string]interface{}{
 					{
@@ -359,8 +369,13 @@ func sendTraces(stopChan <-chan struct{}) {
 				},
 			}
 
+			// Add Content-Type header for JSON format
+			headers := map[string]string{
+				"Content-Type": "application/json",
+			}
+
 			// Send traces
-			err := sendJSON(tracesEndpoint, payload)
+			err := sendJSON(tracesEndpoint, payload, headers)
 			if err != nil {
 				log.Printf("Error sending traces: %v", err)
 			} else {
@@ -371,7 +386,7 @@ func sendTraces(stopChan <-chan struct{}) {
 }
 
 // sendJSON sends a JSON payload to the specified endpoint
-func sendJSON(endpoint string, payload interface{}) error {
+func sendJSON(endpoint string, payload interface{}, headers map[string]string) error {
 	// Marshal payload to JSON
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -386,6 +401,9 @@ func sendJSON(endpoint string, payload interface{}) error {
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 
 	// Send request
 	client := &http.Client{Timeout: 5 * time.Second}
