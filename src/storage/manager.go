@@ -2,7 +2,10 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +23,13 @@ type Manager struct {
 
 // NewManager creates a new storage manager
 func NewManager(cfg config.StorageConfig) (*Manager, error) {
+	// Create a new manager
+	manager := &Manager{
+		config: cfg,
+	}
+
 	// Ensure data directories exist
+	log.Println("Ensuring data directories exist...")
 	if err := ensureDir(cfg.Metrics.DataPath); err != nil {
 		return nil, fmt.Errorf("failed to create metrics data directory: %w", err)
 	}
@@ -31,10 +40,10 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create traces data directory: %w", err)
 	}
 
-	// Create the manager
-	manager := &Manager{
-		config: cfg,
-	}
+	// Log the data directories once
+	log.Printf("Metrics data path: %s", resolvePath(cfg.Metrics.DataPath))
+	log.Printf("Logs data path: %s", resolvePath(cfg.Logs.DataPath))
+	log.Printf("Traces data path: %s", resolvePath(cfg.Traces.DataPath))
 
 	// Initialize metrics storage
 	metricsRetention, err := parseDuration(cfg.Metrics.RetentionPeriod)
@@ -45,14 +54,16 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid metrics block size: %w", err)
 	}
-	metricsStore, err := NewPromTSDBStore(cfg.Metrics.DataPath, metricsRetention, metricsBlockSize, cfg.Metrics.IndexConfig.Compaction)
+	metricsPath := resolvePath(cfg.Metrics.DataPath)
+	metricsStore, err := NewPromTSDBStore(metricsPath, metricsRetention, metricsBlockSize, cfg.Metrics.IndexConfig.Compaction)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize metrics storage: %w", err)
 	}
 	manager.metricsStore = metricsStore
 
 	// Initialize logs storage
-	logsStore, err := NewBadgerStore(cfg.Logs.DataPath, cfg.Logs.Indexing, cfg.Logs.MaxFileSizeMB)
+	logsPath := resolvePath(cfg.Logs.DataPath)
+	logsStore, err := NewBadgerStore(logsPath, cfg.Logs.Indexing, cfg.Logs.MaxFileSizeMB)
 	if err != nil {
 		metricsStore.Close()
 		return nil, fmt.Errorf("failed to initialize logs storage: %w", err)
@@ -67,7 +78,8 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 		return nil, fmt.Errorf("invalid traces retention period: %w", err)
 	}
 	// Assume 2h block size for traces, similar to metrics
-	tracesStore, err := NewPromTSDBStore(cfg.Traces.DataPath, tracesRetention, 2*time.Hour, true)
+	tracesPath := resolvePath(cfg.Traces.DataPath)
+	tracesStore, err := NewPromTSDBStore(tracesPath, tracesRetention, 2*time.Hour, true)
 	if err != nil {
 		metricsStore.Close()
 		logsStore.Close()
@@ -78,34 +90,41 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 	return manager, nil
 }
 
-// Close closes all storage instances
+// Close closes all storage engines
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	log.Println("Closing storage managers...")
 	var errs []error
 
 	if m.metricsStore != nil {
 		if err := m.metricsStore.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close metrics store: %w", err))
+			errs = append(errs, fmt.Errorf("error closing metrics store: %w", err))
 		}
 	}
 
 	if m.logsStore != nil {
 		if err := m.logsStore.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close logs store: %w", err))
+			errs = append(errs, fmt.Errorf("error closing logs store: %w", err))
 		}
 	}
 
 	if m.tracesStore != nil {
 		if err := m.tracesStore.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close traces store: %w", err))
+			errs = append(errs, fmt.Errorf("error closing traces store: %w", err))
 		}
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("errors occurred while closing storage: %v", errs)
+		errMsgs := []string{}
+		for _, err := range errs {
+			errMsgs = append(errMsgs, err.Error())
+		}
+		return fmt.Errorf("errors closing storage: %s", strings.Join(errMsgs, "; "))
 	}
+
+	log.Println("All storage managers closed successfully")
 	return nil
 }
 
@@ -132,7 +151,45 @@ func (m *Manager) TracesStore() *PromTSDBStore {
 
 // ensureDir ensures that the specified directory exists
 func ensureDir(path string) error {
-	return os.MkdirAll(path, 0755)
+	resolvedPath := resolvePath(path)
+	return os.MkdirAll(resolvedPath, 0755)
+}
+
+// resolvePath resolves a path relative to the application root directory
+func resolvePath(path string) string {
+	// Already absolute, return as is
+	if filepath.IsAbs(path) {
+		return path
+	}
+
+	// Get the executable directory to find the app root
+	execPath, err := os.Executable()
+	if err != nil {
+		// If we can't get the executable path, just use the path as is
+		log.Printf("Warning: failed to get executable path: %v", err)
+		return path
+	}
+
+	// The executable is at the app root, so resolve relative to that directory
+	appRoot := filepath.Dir(execPath)
+
+	// If path starts with "./", remove it for clarity
+	originalPath := path
+	path = strings.TrimPrefix(path, "./")
+
+	// If path starts with "../", it's already trying to go to root from config dir
+	// so replace it with direct path from app root
+	path = strings.TrimPrefix(path, "../")
+
+	// Combine the app root with the relative path
+	resolvedPath := filepath.Join(appRoot, path)
+
+	// Only log when converting relative paths
+	if originalPath != resolvedPath {
+		log.Printf("Resolved path: %s -> %s", originalPath, resolvedPath)
+	}
+
+	return resolvedPath
 }
 
 // parseDuration parses a duration string (e.g., "30d", "2h")

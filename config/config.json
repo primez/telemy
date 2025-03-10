@@ -1,6 +1,6 @@
 {
   "service": {
-    "name": "TelemyService",
+    "name": "Telemy",
     "port": 8080,
     "protocols": ["http", "grpc"],
     "logLevel": "info"
@@ -14,7 +14,7 @@
   "storage": {
     "metrics": {
       "engine": "tsdb",
-      "dataPath": "./data/tsdb_metrics",
+      "dataPath": "d:/Temp/telemy/data/tsdb_metrics",
       "retentionPeriod": "30d",
       "indexConfig": {
         "blockSize": "2h",
@@ -23,13 +23,13 @@
     },
     "logs": {
       "engine": "badger",
-      "dataPath": "./data/badger_logs",
+      "dataPath": "d:/Temp/telemy/data/badger_logs",
       "indexing": true,
       "maxFileSizeMB": 100
     },
     "traces": {
       "engine": "tsdb",
-      "dataPath": "./data/tsdb_traces",
+      "dataPath": "d:/Temp/telemy/data/tsdb_traces",
       "retentionPeriod": "7d"
     }
   },

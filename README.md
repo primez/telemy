@@ -40,12 +40,13 @@ Telemy is built with a modular architecture, consisting of the following compone
    go build -o telemy.exe ./src/cmd
    ```
 
-3. Configure the application by editing `config.json` (see Configuration section below)
+3. Configure the application by editing `config/config.json` (see Configuration section below)
 
 4. Run the application directly (without installing as a service):
    ```
    telemy.exe
    ```
+   This will create a `data` directory at the root of the application for storage files.
 
 5. Or install and run as a Windows Service:
    ```
@@ -55,7 +56,7 @@ Telemy is built with a modular architecture, consisting of the following compone
 
 ### Configuration
 
-Telemy is configured using a JSON configuration file. By default, it looks for `config.json` in the current directory, but you can specify a different path using the `-config` flag.
+Telemy is configured using a JSON configuration file. By default, it looks for `config/config.json` in the config directory, but you can specify a different path using the `-config` flag.
 
 Here's an example configuration:
 

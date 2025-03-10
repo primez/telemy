@@ -18,7 +18,7 @@ import (
 
 func main() {
 	// Parse command line flags
-	configPath := flag.String("config", "config.json", "Path to configuration file")
+	configPath := flag.String("config", "config/config.json", "Path to configuration file")
 	installService := flag.Bool("install", false, "Install as a Windows service")
 	uninstallService := flag.Bool("uninstall", false, "Uninstall the Windows service")
 	startService := flag.Bool("start", false, "Start the Windows service")
