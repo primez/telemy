@@ -14,11 +14,11 @@ import (
 
 // MetricsHandler handles OTLP metrics ingestion
 type MetricsHandler struct {
-	store *storage.TSDBStore
+	store *storage.PromTSDBStore
 }
 
 // NewMetricsHandler creates a new metrics handler
-func NewMetricsHandler(store *storage.TSDBStore) *MetricsHandler {
+func NewMetricsHandler(store *storage.PromTSDBStore) *MetricsHandler {
 	return &MetricsHandler{
 		store: store,
 	}

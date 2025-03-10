@@ -1,6 +1,6 @@
 ---
-description: 
-globs: 
+description: Coding pattern preferences
+globs: *.*
 alwaysApply: false
 ---
 # Coding pattern preferences

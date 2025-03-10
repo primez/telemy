@@ -12,9 +12,9 @@ import (
 // Manager manages storage for metrics, logs, and traces
 type Manager struct {
 	config       config.StorageConfig
-	metricsStore *TSDBStore
+	metricsStore *PromTSDBStore
 	logsStore    *BadgerStore
-	tracesStore  *TSDBStore
+	tracesStore  *PromTSDBStore
 	mu           sync.RWMutex
 }
 
@@ -45,7 +45,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid metrics block size: %w", err)
 	}
-	metricsStore, err := NewTSDBStore(cfg.Metrics.DataPath, metricsRetention, metricsBlockSize, cfg.Metrics.IndexConfig.Compaction)
+	metricsStore, err := NewPromTSDBStore(cfg.Metrics.DataPath, metricsRetention, metricsBlockSize, cfg.Metrics.IndexConfig.Compaction)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize metrics storage: %w", err)
 	}
@@ -67,7 +67,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 		return nil, fmt.Errorf("invalid traces retention period: %w", err)
 	}
 	// Assume 2h block size for traces, similar to metrics
-	tracesStore, err := NewTSDBStore(cfg.Traces.DataPath, tracesRetention, 2*time.Hour, true)
+	tracesStore, err := NewPromTSDBStore(cfg.Traces.DataPath, tracesRetention, 2*time.Hour, true)
 	if err != nil {
 		metricsStore.Close()
 		logsStore.Close()
@@ -110,7 +110,7 @@ func (m *Manager) Close() error {
 }
 
 // MetricsStore returns the metrics store
-func (m *Manager) MetricsStore() *TSDBStore {
+func (m *Manager) MetricsStore() *PromTSDBStore {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.metricsStore
@@ -124,7 +124,7 @@ func (m *Manager) LogsStore() *BadgerStore {
 }
 
 // TracesStore returns the traces store
-func (m *Manager) TracesStore() *TSDBStore {
+func (m *Manager) TracesStore() *PromTSDBStore {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.tracesStore

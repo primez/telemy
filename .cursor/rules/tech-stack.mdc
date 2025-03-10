@@ -1,6 +1,6 @@
 ---
-description: 
-globs: 
+description: Technical stack
+globs: *.*
 alwaysApply: false
 ---
 # Technical stack

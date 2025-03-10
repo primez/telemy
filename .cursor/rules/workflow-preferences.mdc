@@ -1,6 +1,6 @@
 ---
-description: 
-globs: 
+description: Coding workflow preferences
+globs: *.*
 alwaysApply: false
 ---
 # Coding workflow preferences

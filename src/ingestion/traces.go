@@ -15,11 +15,11 @@ import (
 
 // TracesHandler handles OTLP traces ingestion
 type TracesHandler struct {
-	store *storage.TSDBStore
+	store *storage.PromTSDBStore
 }
 
 // NewTracesHandler creates a new traces handler
-func NewTracesHandler(store *storage.TSDBStore) *TracesHandler {
+func NewTracesHandler(store *storage.PromTSDBStore) *TracesHandler {
 	return &TracesHandler{
 		store: store,
 	}
