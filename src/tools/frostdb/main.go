@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -285,36 +286,106 @@ func main() {
 
 	// Example 1: Query by label values
 	fmt.Println("\n-------------------------------------------------------------")
-	fmt.Println("QUERY 1: Logs with level_2 and component_1")
+	fmt.Println("QUERY 1: 100 queries with different level and component values")
 	fmt.Println("-------------------------------------------------------------")
-	fmt.Println("Note: FrostDB returns results as batched Arrow records.")
-	fmt.Println("Each record may contain multiple matching rows in one response.")
+	fmt.Println("Running 100 queries with different combinations...")
 
-	startQuery := time.Now()
-	recordCount := 0
-	err = engine.ScanTable("logs_table").
-		Filter(
-			logicalplan.And(
-				logicalplan.Col("labels.level").Eq(logicalplan.Literal("level_2")),
-				logicalplan.Col("labels.component").Eq(logicalplan.Literal("component_1")),
-			),
-		).
-		Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
-			recordCount++
-			fmt.Printf("Result batch %d:\n%s\n", recordCount, formatRecord(r))
-			return nil
-		})
-	if err != nil {
-		log.Printf("Query error: %v", err)
+	totalQueries := 100
+	var totalDuration time.Duration
+	minDuration := time.Duration(math.MaxInt64)
+	maxDuration := time.Duration(0)
+	var totalRecords int
+
+	// Track query times for analysis
+	queryTimes := make([]time.Duration, totalQueries)
+	recordCounts := make([]int, totalQueries)
+
+	for i := 0; i < totalQueries; i++ {
+		// Get different level and component combinations
+		level := fmt.Sprintf("level_%d", i%4)
+		component := fmt.Sprintf("component_%d", i%3)
+
+		queryStart := time.Now()
+		recordCount := 0
+
+		err = engine.ScanTable("logs_table").
+			Filter(
+				logicalplan.And(
+					logicalplan.Col("labels.level").Eq(logicalplan.Literal(level)),
+					logicalplan.Col("labels.component").Eq(logicalplan.Literal(component)),
+				),
+			).
+			Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
+				recordCount++
+				// Only print details for first few queries to avoid flooding console
+				if i < 3 {
+					fmt.Printf("Query %d (level=%s, component=%s) Result batch %d:\n%s\n",
+						i+1, level, component, recordCount, formatRecord(r))
+				}
+				return nil
+			})
+		if err != nil {
+			log.Printf("Query %d error: %v", i+1, err)
+			continue
+		}
+
+		queryTime := time.Since(queryStart)
+		queryTimes[i] = queryTime
+		recordCounts[i] = recordCount
+
+		totalDuration += queryTime
+		totalRecords += recordCount
+
+		if queryTime < minDuration {
+			minDuration = queryTime
+		}
+		if queryTime > maxDuration {
+			maxDuration = queryTime
+		}
+
+		// Print progress every 10 queries
+		if (i+1)%10 == 0 {
+			fmt.Printf("Completed %d/%d queries...\n", i+1, totalQueries)
+		}
 	}
-	queryDuration := time.Since(startQuery)
-	fmt.Printf("Query completed. Found %d record batches in %v\n", recordCount, queryDuration)
+
+	avgDuration := totalDuration / time.Duration(totalQueries)
+	fmt.Println("\nQuery Summary:")
+	fmt.Printf("Total queries: %d\n", totalQueries)
+	fmt.Printf("Total records: %d\n", totalRecords)
+	fmt.Printf("Total duration: %v\n", totalDuration)
+	fmt.Printf("Average duration: %v\n", avgDuration)
+	fmt.Printf("Min duration: %v\n", minDuration)
+	fmt.Printf("Max duration: %v\n", maxDuration)
+
+	// Display histogram of query times
+	fmt.Println("\nQuery Time Distribution:")
+	buckets := 5
+	bucketSize := (maxDuration - minDuration) / time.Duration(buckets)
+	if bucketSize == 0 {
+		bucketSize = 1 * time.Microsecond // Prevent division by zero
+	}
+
+	histogram := make([]int, buckets)
+	for _, duration := range queryTimes {
+		bucket := int((duration - minDuration) / bucketSize)
+		if bucket >= buckets {
+			bucket = buckets - 1
+		}
+		histogram[bucket]++
+	}
+
+	for i := 0; i < buckets; i++ {
+		lowerBound := minDuration + time.Duration(i)*bucketSize
+		upperBound := lowerBound + bucketSize
+		fmt.Printf("%v to %v: %d queries\n", lowerBound, upperBound, histogram[i])
+	}
 
 	// Example 2: Query by timestamp range
 	fmt.Println("\n-------------------------------------------------------------")
 	fmt.Println("QUERY 2: Logs within a time range")
 	fmt.Println("-------------------------------------------------------------")
-	startQuery = time.Now()
+	startQuery := time.Now()
 	timeCount := 0
 	now := time.Now().UnixNano()
 	tenSecondsAgo := now - 10*int64(time.Second)
@@ -341,7 +412,7 @@ func main() {
 	if err != nil {
 		log.Printf("Time-based query error: %v", err)
 	}
-	queryDuration = time.Since(startQuery)
+	queryDuration := time.Since(startQuery)
 	fmt.Printf("Time query completed. Found %d record batches in %v\n", timeCount, queryDuration)
 
 	// Example 3: Aggregation query
