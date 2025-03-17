@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"telemy/alerting"
@@ -19,34 +20,37 @@ import (
 func main() {
 	// Parse command line flags
 	configPath := flag.String("config", "config/config.json", "Path to configuration file")
-	installService := flag.Bool("install", false, "Install as a Windows service")
-	uninstallService := flag.Bool("uninstall", false, "Uninstall the Windows service")
-	startService := flag.Bool("start", false, "Start the Windows service")
-	stopService := flag.Bool("stop", false, "Stop the Windows service")
+
+	// Only define Windows service flags on Windows platforms
+	var installService, uninstallService, startService, stopService *bool
+	if runtime.GOOS == "windows" {
+		installService = flag.Bool("install", false, "Install as a Windows service")
+		uninstallService = flag.Bool("uninstall", false, "Uninstall the Windows service")
+		startService = flag.Bool("start", false, "Start the Windows service")
+		stopService = flag.Bool("stop", false, "Stop the Windows service")
+	}
+
 	flag.Parse()
 
-	// Handle service management commands
-	if *installService {
-		if err := service.RunServiceCommand(service.Install); err != nil {
-			log.Fatalf("Failed to install service: %v", err)
+	// Handle service management commands on Windows
+	if runtime.GOOS == "windows" && ((*installService == true) ||
+		(*uninstallService == true) ||
+		(*startService == true) ||
+		(*stopService == true)) {
+
+		var cmd service.ServiceCommand
+		if *installService {
+			cmd = service.Install
+		} else if *uninstallService {
+			cmd = service.Uninstall
+		} else if *startService {
+			cmd = service.Start
+		} else if *stopService {
+			cmd = service.Stop
 		}
-		return
-	}
-	if *uninstallService {
-		if err := service.RunServiceCommand(service.Uninstall); err != nil {
-			log.Fatalf("Failed to uninstall service: %v", err)
-		}
-		return
-	}
-	if *startService {
-		if err := service.RunServiceCommand(service.Start); err != nil {
-			log.Fatalf("Failed to start service: %v", err)
-		}
-		return
-	}
-	if *stopService {
-		if err := service.RunServiceCommand(service.Stop); err != nil {
-			log.Fatalf("Failed to stop service: %v", err)
+
+		if err := service.RunServiceCommand(cmd); err != nil {
+			log.Fatalf("Service command failed: %v", err)
 		}
 		return
 	}

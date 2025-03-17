@@ -292,7 +292,7 @@ func (e *Engine) QueryTraces(query, startTime, endTime, limit string) (*QueryRes
 	}
 
 	// Execute the query
-	dataPoints, err := e.storageManager.TracesStore().QueryMetrics(metricQuery)
+	dataPoints, err := e.storageManager.TracesStore().QueryTraces(metricQuery)
 	if err != nil {
 		return nil, fmt.Errorf("error executing traces query: %w", err)
 	}

@@ -15,11 +15,11 @@ import (
 
 // TracesHandler handles OTLP traces ingestion
 type TracesHandler struct {
-	store *storage.PromTSDBStore
+	store storage.TracesStore
 }
 
 // NewTracesHandler creates a new traces handler
-func NewTracesHandler(store *storage.PromTSDBStore) *TracesHandler {
+func NewTracesHandler(store storage.TracesStore) *TracesHandler {
 	return &TracesHandler{
 		store: store,
 	}
@@ -104,7 +104,7 @@ func (h *TracesHandler) processTraces(traces *OTLPTracesRequest) error {
 				}
 
 				// Store the span duration
-				if err := h.store.StoreMetric(durationPoint); err != nil {
+				if err := h.store.StoreTrace(durationPoint); err != nil {
 					return fmt.Errorf("error storing span duration: %w", err)
 				}
 
@@ -142,7 +142,7 @@ func (h *TracesHandler) processTraces(traces *OTLPTracesRequest) error {
 							Labels:    eventAttrLabels,
 						}
 
-						if err := h.store.StoreMetric(eventPoint); err != nil {
+						if err := h.store.StoreTrace(eventPoint); err != nil {
 							return fmt.Errorf("error storing span event: %w", err)
 						}
 					}
@@ -161,7 +161,7 @@ func (h *TracesHandler) processTraces(traces *OTLPTracesRequest) error {
 					Labels:    statusLabels,
 				}
 
-				if err := h.store.StoreMetric(statusPoint); err != nil {
+				if err := h.store.StoreTrace(statusPoint); err != nil {
 					return fmt.Errorf("error storing span status: %w", err)
 				}
 			}

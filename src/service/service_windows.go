@@ -1,3 +1,6 @@
+//go:build windows
+// +build windows
+
 package service
 
 import (
@@ -261,47 +264,30 @@ func StopService() error {
 	}
 	defer s.Close()
 
-	// Get the service status
-	status, err := s.Query()
-	if err != nil {
-		return fmt.Errorf("failed to query service status: %w", err)
-	}
-
-	// If the service is not running, there's nothing to do
-	if status.State == svc.Stopped {
-		log.Printf("Service %s is already stopped", serviceName)
-		return nil
-	}
-
 	// Stop the service
-	_, err = s.Control(svc.Stop)
+	status, err := s.Control(svc.Stop)
 	if err != nil {
-		return fmt.Errorf("failed to stop service: %w", err)
+		return fmt.Errorf("failed to send stop control: %w", err)
 	}
 
-	log.Printf("Service %s stopped successfully", serviceName)
+	log.Printf("Service %s is stopping (current status: %v)", serviceName, status.State)
 	return nil
 }
 
-// ServiceCommand is a command for the service management
+// ServiceCommand is used to specify which service command to run
 type ServiceCommand int
 
 const (
-	// Install installs the service
 	Install ServiceCommand = iota
-	// Uninstall uninstalls the service
 	Uninstall
-	// Start starts the service
 	Start
-	// Stop stops the service
 	Stop
 )
 
-// RunServiceCommand runs a service command
+// RunServiceCommand runs the specified service command
 func RunServiceCommand(cmd ServiceCommand) error {
 	switch cmd {
 	case Install:
-		// Get the executable path
 		execPath, err := os.Executable()
 		if err != nil {
 			return fmt.Errorf("failed to get executable path: %w", err)

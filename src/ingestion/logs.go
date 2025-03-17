@@ -14,11 +14,11 @@ import (
 
 // LogsHandler handles OTLP logs ingestion
 type LogsHandler struct {
-	store *storage.BadgerStore
+	store storage.LogsStore
 }
 
 // NewLogsHandler creates a new logs handler
-func NewLogsHandler(store *storage.BadgerStore) *LogsHandler {
+func NewLogsHandler(store storage.LogsStore) *LogsHandler {
 	return &LogsHandler{
 		store: store,
 	}
