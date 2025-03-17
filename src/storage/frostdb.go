@@ -16,7 +16,7 @@ import (
 	"github.com/polarsignals/frostdb"
 	"github.com/polarsignals/frostdb/dynparquet"
 	"github.com/polarsignals/frostdb/index"
-	frostdbQuery "github.com/polarsignals/frostdb/query"
+	"github.com/polarsignals/frostdb/query"
 	"github.com/polarsignals/frostdb/query/logicalplan"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -41,6 +41,24 @@ type TracesSchema struct {
 	Labels    map[string]string `frostdb:",asc"`
 }
 
+// FrostDBOptions contains configuration options for FrostDB
+type FrostDBOptions struct {
+	BatchSize        int
+	FlushInterval    time.Duration
+	ActiveMemorySize int64
+	WALEnabled       bool
+}
+
+// DefaultFrostDBOptions returns default options for FrostDB
+func DefaultFrostDBOptions() *FrostDBOptions {
+	return &FrostDBOptions{
+		BatchSize:        1000,
+		FlushInterval:    30 * time.Second,
+		ActiveMemorySize: 100 * frostdb.MiB,
+		WALEnabled:       true,
+	}
+}
+
 // FrostDBStore implements MetricsStore, LogsStore, and TracesStore interfaces using FrostDB
 type FrostDBStore struct {
 	columnstore *frostdb.ColumnStore
@@ -48,6 +66,9 @@ type FrostDBStore struct {
 	tables      map[string]*frostdb.Table
 	path        string
 	retention   time.Duration
+
+	// Query engine
+	queryEngine *query.LocalEngine
 
 	// Batching support
 	metricBatch     dynparquet.Samples
@@ -62,13 +83,19 @@ type FrostDBStore struct {
 	traceBatchSize int
 	traceBatchMu   sync.Mutex
 
-	batchMaxSize int
-	flushTicker  *time.Ticker
-	shutdown     chan struct{}
+	batchMaxSize  int
+	flushTicker   *time.Ticker
+	flushInterval time.Duration
+	shutdown      chan struct{}
 }
 
 // NewFrostDBStore creates a new FrostDB store
-func NewFrostDBStore(path string, retention time.Duration) (*FrostDBStore, error) {
+func NewFrostDBStore(path string, retention time.Duration, opts *FrostDBOptions) (*FrostDBStore, error) {
+	// If options not provided, use defaults
+	if opts == nil {
+		opts = DefaultFrostDBOptions()
+	}
+
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
@@ -99,16 +126,23 @@ func NewFrostDBStore(path string, retention time.Duration) (*FrostDBStore, error
 		},
 	}
 
-	// Create column store with Windows-friendly options
-	columnstore, err := frostdb.New(
+	// Build column store options
+	columnStoreOpts := []frostdb.Option{
 		frostdb.WithLogger(logger),
-		frostdb.WithWAL(),
 		frostdb.WithStoragePath(path),
-		frostdb.WithActiveMemorySize(100*frostdb.MiB),
+		frostdb.WithActiveMemorySize(opts.ActiveMemorySize),
 		frostdb.WithRegistry(registry),
 		frostdb.WithIndexConfig(indexConfig),
-		frostdb.WithSnapshotTriggerSize(100*frostdb.MiB),
-	)
+		frostdb.WithSnapshotTriggerSize(100 * frostdb.MiB),
+	}
+
+	// Add WAL if enabled
+	if opts.WALEnabled {
+		columnStoreOpts = append(columnStoreOpts, frostdb.WithWAL())
+	}
+
+	// Create column store with Windows-friendly options
+	columnstore, err := frostdb.New(columnStoreOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create column store: %w", err)
 	}
@@ -120,18 +154,23 @@ func NewFrostDBStore(path string, retention time.Duration) (*FrostDBStore, error
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	// Build the query with the FrostDB API - use the query package properly
+	engine := query.NewEngine(memory.DefaultAllocator, database.TableProvider())
+
 	// Create store with batching support
 	store := &FrostDBStore{
-		columnstore:  columnstore,
-		database:     database,
-		tables:       make(map[string]*frostdb.Table),
-		path:         path,
-		retention:    retention,
-		metricBatch:  dynparquet.Samples{},
-		logBatch:     dynparquet.Samples{},
-		traceBatch:   dynparquet.Samples{},
-		batchMaxSize: 1_000, // Default batch size of 10,000 samples
-		shutdown:     make(chan struct{}),
+		columnstore:   columnstore,
+		database:      database,
+		queryEngine:   engine,
+		tables:        make(map[string]*frostdb.Table),
+		path:          path,
+		retention:     retention,
+		metricBatch:   dynparquet.Samples{},
+		logBatch:      dynparquet.Samples{},
+		traceBatch:    dynparquet.Samples{},
+		batchMaxSize:  opts.BatchSize,
+		flushInterval: opts.FlushInterval,
+		shutdown:      make(chan struct{}),
 	}
 
 	// Create tables
@@ -140,11 +179,16 @@ func NewFrostDBStore(path string, retention time.Duration) (*FrostDBStore, error
 		return nil, fmt.Errorf("failed to initialize tables: %w", err)
 	}
 
-	// Start the background flush timer (flush every 30 seconds)
-	store.flushTicker = time.NewTicker(30 * time.Second)
+	// Start the background flush timer
+	store.flushTicker = time.NewTicker(store.flushInterval)
 	go store.flushRoutine()
 
 	return store, nil
+}
+
+// For backward compatibility
+func NewDefaultFrostDBStore(path string, retention time.Duration) (*FrostDBStore, error) {
+	return NewFrostDBStore(path, retention, nil)
 }
 
 // initializeTables creates the tables if they don't exist
@@ -351,35 +395,62 @@ func (s *FrostDBStore) StoreMetric(point *DataPoint) error {
 }
 
 // QueryMetrics queries metrics based on criteria
-func (s *FrostDBStore) QueryMetrics(query *MetricQuery) ([]*DataPoint, error) {
-	// Create timestamp filters
-	startTime := query.StartTime.UnixNano()
-	endTime := query.EndTime.UnixNano()
+func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, error) {
+	// Handle time range - use defaults if not provided
+	var startTime, endTime int64
 
-	// Build the query with the FrostDB API - use the query package properly
-	engine := frostdbQuery.NewEngine(memory.DefaultAllocator, s.database.TableProvider())
+	// If start time is zero value, use Unix epoch start (1970)
+	if metricQuery.StartTime.IsZero() {
+		startTime = 0 // Beginning of time
+	} else {
+		startTime = metricQuery.StartTime.UnixNano()
+	}
 
-	// Build and execute the query - use string table name instead of ID
-	scanner := engine.ScanTable("metrics").
-		Filter(
-			logicalplan.And(
-				logicalplan.Col("timestamp").Gt(logicalplan.Literal(startTime)),
-				logicalplan.Col("timestamp").Lt(logicalplan.Literal(endTime)),
-			),
-		).
+	// If end time is zero value, use current time
+	if metricQuery.EndTime.IsZero() {
+		endTime = time.Now().UnixNano()
+	} else {
+		endTime = metricQuery.EndTime.UnixNano()
+	}
+
+	// Start building the filter expression with timestamp range
+	filterExpr := logicalplan.And(
+		logicalplan.Col("timestamp").GtEq(logicalplan.Literal(startTime)), // Use GtEq instead of Gt to include exact start time
+		logicalplan.Col("timestamp").LtEq(logicalplan.Literal(endTime)),   // Use LtEq instead of Lt to include exact end time
+	)
+
+	// If we have specific label filters that can be pushed down to FrostDB, add them
+	if len(metricQuery.FilterLabels) > 0 {
+		for key, value := range metricQuery.FilterLabels {
+			labelPath := fmt.Sprintf("labels.%s", key)
+			labelExpr := logicalplan.Col(labelPath).Eq(logicalplan.Literal(value))
+
+			// Combine with the existing filter
+			filterExpr = logicalplan.And(filterExpr, labelExpr)
+		}
+	}
+
+	// Build and execute the query using the reused query engine
+	scanner := s.queryEngine.ScanTable("metrics").
+		Filter(filterExpr).
 		Project(
 			logicalplan.Col("timestamp"),
 			logicalplan.Col("value"),
 			logicalplan.Col("labels"),
 		)
 
+	// If there's a limit, apply it at the query level
+	if metricQuery.Limit > 0 {
+		scanner = scanner.Limit(logicalplan.Literal(int64(metricQuery.Limit)))
+	}
+
 	var dataPoints []*DataPoint
 
-	// Execute the query with callback function as shown in the example
+	// Execute the query with callback function
 	err := scanner.Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
 		numRows := r.NumRows()
 
-		// Get columns - need to extract from the record
+		// Get columns from the record
 		timestampCol := r.Column(0).(*array.Int64)
 		valueCol := r.Column(1).(*array.Int64)
 		labelsCol := r.Column(2)
@@ -421,20 +492,16 @@ func (s *FrostDBStore) QueryMetrics(query *MetricQuery) ([]*DataPoint, error) {
 		return nil, fmt.Errorf("error executing query: %w", err)
 	}
 
-	// Apply label filter if provided
-	if query.LabelFilter != nil {
+	// Apply any additional complex label filtering that couldn't be pushed down
+	// This handles cases where the LabelFilter is a custom function that can't be expressed in FrostDB query language
+	if metricQuery.LabelFilter != nil {
 		filteredPoints := make([]*DataPoint, 0, len(dataPoints))
 		for _, point := range dataPoints {
-			if query.LabelFilter(point.Labels) {
+			if metricQuery.LabelFilter(point.Labels) {
 				filteredPoints = append(filteredPoints, point)
 			}
 		}
 		dataPoints = filteredPoints
-	}
-
-	// Apply limit if provided
-	if query.Limit > 0 && len(dataPoints) > query.Limit {
-		dataPoints = dataPoints[:query.Limit]
 	}
 
 	return dataPoints, nil
@@ -475,35 +542,57 @@ func (s *FrostDBStore) StoreLog(entry *LogEntry) error {
 }
 
 // QueryLogs queries logs based on criteria
-func (s *FrostDBStore) QueryLogs(query *LogQuery) ([]*LogEntry, error) {
-	// Create timestamp filters
-	startTime := query.StartTime.UnixNano()
-	endTime := query.EndTime.UnixNano()
+func (s *FrostDBStore) QueryLogs(logQuery *LogQuery) ([]*LogEntry, error) {
+	// Handle time range - use defaults if not provided
+	var startTime, endTime int64
 
-	// Build the query with the FrostDB API - use the query package properly
-	engine := frostdbQuery.NewEngine(memory.DefaultAllocator, s.database.TableProvider())
+	// If start time is zero value, use Unix epoch start (1970)
+	if logQuery.StartTime.IsZero() {
+		startTime = 0 // Beginning of time
+	} else {
+		startTime = logQuery.StartTime.UnixNano()
+	}
 
-	// Build and execute the query - use string table name instead of ID
-	scanner := engine.ScanTable("logs").
-		Filter(
-			logicalplan.And(
-				logicalplan.Col("timestamp").Gt(logicalplan.Literal(startTime)),
-				logicalplan.Col("timestamp").Lt(logicalplan.Literal(endTime)),
-			),
-		).
+	// If end time is zero value, use current time
+	if logQuery.EndTime.IsZero() {
+		endTime = time.Now().UnixNano()
+	} else {
+		endTime = logQuery.EndTime.UnixNano()
+	}
+
+	// Start building the filter expression with timestamp range
+	filterExpr := logicalplan.And(
+		logicalplan.Col("timestamp").GtEq(logicalplan.Literal(startTime)),
+		logicalplan.Col("timestamp").LtEq(logicalplan.Literal(endTime)),
+	)
+
+	// If there are specific log level filters, add them
+	if logQuery.Level != "" {
+		levelExpr := logicalplan.Col("exampleType").Eq(logicalplan.Literal(logQuery.Level))
+		filterExpr = logicalplan.And(filterExpr, levelExpr)
+	}
+
+	// Build and execute the query using the reused query engine
+	scanner := s.queryEngine.ScanTable("logs").
+		Filter(filterExpr).
 		Project(
 			logicalplan.Col("timestamp"),
 			logicalplan.Col("exampleType"), // For level
 			logicalplan.Col("labels"),      // For labels including message
 		)
 
+	// If there's a limit, apply it at the query level
+	if logQuery.Limit > 0 {
+		scanner = scanner.Limit(logicalplan.Literal(int64(logQuery.Limit)))
+	}
+
 	var logEntries []*LogEntry
 
-	// Execute the query with callback function as shown in the example
+	// Execute the query with callback function
 	err := scanner.Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
 		numRows := r.NumRows()
 
-		// Get columns - need to extract from the record
+		// Get columns from the record
 		timestampCol := r.Column(0).(*array.Int64)
 		levelCol := r.Column(1)
 		labelsCol := r.Column(2)
@@ -562,20 +651,15 @@ func (s *FrostDBStore) QueryLogs(query *LogQuery) ([]*LogEntry, error) {
 		return nil, fmt.Errorf("error executing query: %w", err)
 	}
 
-	// Apply filter if provided
-	if query.Filter != nil {
+	// Apply any additional complex filtering that couldn't be pushed down
+	if logQuery.Filter != nil {
 		filteredEntries := make([]*LogEntry, 0, len(logEntries))
 		for _, entry := range logEntries {
-			if query.Filter(entry) {
+			if logQuery.Filter(entry) {
 				filteredEntries = append(filteredEntries, entry)
 			}
 		}
 		logEntries = filteredEntries
-	}
-
-	// Apply limit if provided
-	if query.Limit > 0 && len(logEntries) > query.Limit {
-		logEntries = logEntries[:query.Limit]
 	}
 
 	return logEntries, nil
@@ -610,35 +694,63 @@ func (s *FrostDBStore) StoreTrace(point *DataPoint) error {
 }
 
 // QueryTraces queries traces based on criteria
-func (s *FrostDBStore) QueryTraces(query *MetricQuery) ([]*DataPoint, error) {
-	// Create timestamp filters
-	startTime := query.StartTime.UnixNano()
-	endTime := query.EndTime.UnixNano()
+func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, error) {
+	// Handle time range - use defaults if not provided
+	var startTime, endTime int64
 
-	// Build the query with the FrostDB API - use the query package properly
-	engine := frostdbQuery.NewEngine(memory.DefaultAllocator, s.database.TableProvider())
+	// If start time is zero value, use Unix epoch start (1970)
+	if metricQuery.StartTime.IsZero() {
+		startTime = 0 // Beginning of time
+	} else {
+		startTime = metricQuery.StartTime.UnixNano()
+	}
 
-	// Build and execute the query - use string table name instead of ID
-	scanner := engine.ScanTable("traces").
-		Filter(
-			logicalplan.And(
-				logicalplan.Col("timestamp").Gt(logicalplan.Literal(startTime)),
-				logicalplan.Col("timestamp").Lt(logicalplan.Literal(endTime)),
-			),
-		).
+	// If end time is zero value, use current time
+	if metricQuery.EndTime.IsZero() {
+		endTime = time.Now().UnixNano()
+	} else {
+		endTime = metricQuery.EndTime.UnixNano()
+	}
+
+	// Start building the filter expression with timestamp range
+	filterExpr := logicalplan.And(
+		logicalplan.Col("timestamp").GtEq(logicalplan.Literal(startTime)),
+		logicalplan.Col("timestamp").LtEq(logicalplan.Literal(endTime)),
+	)
+
+	// If we have specific label filters that can be pushed down to FrostDB, add them
+	if len(metricQuery.FilterLabels) > 0 {
+		// Build a series of label equality filters for the specified labels
+		for key, value := range metricQuery.FilterLabels {
+			labelPath := fmt.Sprintf("labels.%s", key)
+			labelExpr := logicalplan.Col(labelPath).Eq(logicalplan.Literal(value))
+
+			// Combine with the existing filter
+			filterExpr = logicalplan.And(filterExpr, labelExpr)
+		}
+	}
+
+	// Build and execute the query using the reused query engine
+	scanner := s.queryEngine.ScanTable("traces").
+		Filter(filterExpr).
 		Project(
 			logicalplan.Col("timestamp"),
 			logicalplan.Col("value"),
 			logicalplan.Col("labels"),
 		)
 
+	// If there's a limit, apply it at the query level
+	if metricQuery.Limit > 0 {
+		scanner = scanner.Limit(logicalplan.Literal(int64(metricQuery.Limit)))
+	}
+
 	var dataPoints []*DataPoint
 
-	// Execute the query with callback function as shown in the example
+	// Execute the query with callback function
 	err := scanner.Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
 		numRows := r.NumRows()
 
-		// Get columns - need to extract from the record
+		// Get columns from the record
 		timestampCol := r.Column(0).(*array.Int64)
 		valueCol := r.Column(1).(*array.Int64)
 		labelsCol := r.Column(2)
@@ -680,20 +792,16 @@ func (s *FrostDBStore) QueryTraces(query *MetricQuery) ([]*DataPoint, error) {
 		return nil, fmt.Errorf("error executing query: %w", err)
 	}
 
-	// Apply label filter if provided
-	if query.LabelFilter != nil {
+	// Apply any additional complex label filtering that couldn't be pushed down
+	// This handles cases where the LabelFilter is a custom function that can't be expressed in FrostDB query language
+	if metricQuery.LabelFilter != nil {
 		filteredPoints := make([]*DataPoint, 0, len(dataPoints))
 		for _, point := range dataPoints {
-			if query.LabelFilter(point.Labels) {
+			if metricQuery.LabelFilter(point.Labels) {
 				filteredPoints = append(filteredPoints, point)
 			}
 		}
 		dataPoints = filteredPoints
-	}
-
-	// Apply limit if provided
-	if query.Limit > 0 && len(dataPoints) > query.Limit {
-		dataPoints = dataPoints[:query.Limit]
 	}
 
 	return dataPoints, nil

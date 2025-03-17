@@ -15,7 +15,9 @@ Telemy is an all-in-one telemetry application that replaces multiple components 
 Telemy is built with a modular architecture, consisting of the following components:
 
 - **Ingestion Module**: Receives OTLP data via HTTP and gRPC endpoints
-- **Storage Module**: Stores telemetry data using TSDB (for metrics and traces) and BadgerDB (for logs)
+- **Storage Module**: Stores telemetry data using either:
+  - TSDB (for metrics and traces) and BadgerDB (for logs)
+  - FrostDB (unified columnar storage for all telemetry types)
 - **Query Engine**: Executes queries against the storage engines
 - **Dashboard Module**: Serves a web UI for visualizing telemetry data
 - **Alerting Module**: Evaluates alert rules and sends notifications
@@ -76,22 +78,26 @@ Here's an example configuration:
   },
   "storage": {
     "metrics": {
-      "engine": "tsdb",
-      "dataPath": "./data/tsdb_metrics",
-      "retentionPeriod": "30d",
-      "indexConfig": {
+      "engine": {
+        "type": "tsdb",
         "blockSize": "2h",
         "compaction": true
-      }
+      },
+      "dataPath": "./data/tsdb_metrics",
+      "retentionPeriod": "30d"
     },
     "logs": {
-      "engine": "badger",
+      "engine": {
+        "type": "badger",
+        "maxFileSizeMB": 100
+      },
       "dataPath": "./data/badger_logs",
-      "indexing": true,
-      "maxFileSizeMB": 100
+      "indexing": true
     },
     "traces": {
-      "engine": "tsdb",
+      "engine": {
+        "type": "tsdb"
+      },
       "dataPath": "./data/tsdb_traces",
       "retentionPeriod": "7d"
     }
@@ -133,6 +139,101 @@ Here's an example configuration:
   }
 }
 ```
+
+#### Storage Engines
+
+Telemy supports multiple storage engines:
+
+1. **Default Storage**:
+   - TSDB for metrics and traces
+   - BadgerDB for logs
+
+2. **FrostDB Storage**:
+   - Unified columnar storage for all telemetry types
+   - High-performance batch processing
+   - Optimized for analytical queries
+   - Configurable memory and disk usage
+
+Each storage type can be configured with a specific engine and its options. The engine configuration uses an object structure with a `type` field and engine-specific options, including retention periods and indexing settings:
+
+```json
+"storage": {
+  "metrics": {
+    "engine": {
+      "type": "tsdb",
+      "blockSize": "2h",
+      "compaction": true,
+      "retentionPeriod": "30d"
+    },
+    "dataPath": "./data/tsdb_metrics"
+  },
+  "logs": {
+    "engine": {
+      "type": "badger",
+      "maxFileSizeMB": 100,
+      "indexing": true
+    },
+    "dataPath": "./data/badger_logs"
+  }
+}
+```
+
+To use FrostDB as the storage engine:
+
+```json
+"storage": {
+  "metrics": {
+    "engine": {
+      "type": "frostdb",
+      "batchSize": 10000,
+      "flushInterval": "15s",
+      "activeMemoryMB": 200,
+      "walEnabled": true,
+      "retentionPeriod": "30d"
+    },
+    "dataPath": "./data/frostdb"
+  },
+  "logs": {
+    "engine": {
+      "type": "frostdb",
+      "useSettingsFrom": "metrics",
+      "indexing": true
+    },
+    "dataPath": "./data/frostdb"
+  },
+  "traces": {
+    "engine": {
+      "type": "frostdb",
+      "useSettingsFrom": "metrics",
+      "retentionPeriod": "7d"
+    },
+    "dataPath": "./data/frostdb"
+  }
+}
+```
+
+**Engine-Specific Configuration Options**:
+
+| Engine | Option | Description | Default |
+|--------|--------|-------------|---------|
+| `tsdb` | `blockSize` | Time duration for each block | 2h |
+| `tsdb` | `compaction` | Whether to enable compaction | true |
+| `tsdb` | `retentionPeriod` | How long to retain data | 30d |
+| `badger` | `maxFileSizeMB` | Maximum size of each log file in MB | 100 |
+| `badger` | `indexing` | Whether to enable indexing for faster queries | true |
+| `frostdb` | `batchSize` | Number of records to batch before writing to disk | 1000 |
+| `frostdb` | `flushInterval` | How often to flush batched data to disk | 30s |
+| `frostdb` | `activeMemoryMB` | Memory allocated for active data (in MB) | 100 |
+| `frostdb` | `walEnabled` | Whether to enable the Write-Ahead Log for durability | true |
+| `frostdb` | `retentionPeriod` | How long to retain data | 30d |
+| `frostdb` | `indexing` | Whether to enable indexing for faster queries | true |
+| `frostdb` | `useSettingsFrom` | Use settings from another section ("metrics", "logs", or "traces") | - |
+
+**Note**: When using FrostDB for all telemetry types, you can have them share settings. Set the `useSettingsFrom` field to indicate which section's settings should be used. For example, setting `useSettingsFrom: "metrics"` in logs and traces will use the FrostDB settings from the metrics section.
+
+Sample configurations for both approaches are available:
+- Standard configuration: `config/config.json`
+- FrostDB configuration: `config/config_frostdb.json`
 
 ### Usage
 

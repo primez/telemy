@@ -43,33 +43,148 @@ type StorageConfig struct {
 	Traces  TracesStorageConfig  `json:"traces"`
 }
 
+// EngineConfig is a generic interface for engine configurations
+type EngineConfig struct {
+	Type string `json:"type"`
+	// Engine-specific configuration is handled by the specific engine types
+	// and unmarshaled from the same JSON object
+	TSDBConfig    *TSDBConfig    `json:"-"`
+	BadgerConfig  *BadgerConfig  `json:"-"`
+	FrostDBConfig *FrostDBConfig `json:"-"`
+}
+
+// UnmarshalJSON implements the json.Unmarshaler interface to handle
+// engine configuration objects with different structures based on type
+func (ec *EngineConfig) UnmarshalJSON(data []byte) error {
+	// First, parse the type field
+	type engineType struct {
+		Type string `json:"type"`
+	}
+	var et engineType
+	if err := json.Unmarshal(data, &et); err != nil {
+		return err
+	}
+	ec.Type = et.Type
+
+	// Based on the type, unmarshal to the appropriate config struct
+	switch ec.Type {
+	case "tsdb":
+		var conf TSDBConfig
+		if err := json.Unmarshal(data, &conf); err != nil {
+			return err
+		}
+		ec.TSDBConfig = &conf
+	case "badger":
+		var conf BadgerConfig
+		if err := json.Unmarshal(data, &conf); err != nil {
+			return err
+		}
+		ec.BadgerConfig = &conf
+	case "frostdb":
+		var conf FrostDBConfig
+		if err := json.Unmarshal(data, &conf); err != nil {
+			return err
+		}
+		ec.FrostDBConfig = &conf
+	default:
+		// For simple string-based engines with no config, do nothing
+	}
+	return nil
+}
+
+// MarshalJSON implements the json.Marshaler interface to convert the engine
+// configuration back to JSON
+func (ec *EngineConfig) MarshalJSON() ([]byte, error) {
+	// Create a map to hold all the fields
+	m := make(map[string]interface{})
+	m["type"] = ec.Type
+
+	// Add the specific engine configuration fields
+	var additionalFields map[string]interface{}
+
+	switch ec.Type {
+	case "tsdb":
+		if ec.TSDBConfig != nil {
+			tsdbJSON, err := json.Marshal(ec.TSDBConfig)
+			if err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(tsdbJSON, &additionalFields); err != nil {
+				return nil, err
+			}
+		}
+	case "badger":
+		if ec.BadgerConfig != nil {
+			badgerJSON, err := json.Marshal(ec.BadgerConfig)
+			if err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(badgerJSON, &additionalFields); err != nil {
+				return nil, err
+			}
+		}
+	case "frostdb":
+		if ec.FrostDBConfig != nil {
+			frostdbJSON, err := json.Marshal(ec.FrostDBConfig)
+			if err != nil {
+				return nil, err
+			}
+			if err := json.Unmarshal(frostdbJSON, &additionalFields); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Merge the additional fields
+	for k, v := range additionalFields {
+		if k != "type" { // Avoid overwriting the type
+			m[k] = v
+		}
+	}
+
+	return json.Marshal(m)
+}
+
+// TSDBConfig represents TSDB-specific configuration
+type TSDBConfig struct {
+	BlockSize       string `json:"blockSize,omitempty"`
+	Compaction      bool   `json:"compaction,omitempty"`
+	RetentionPeriod string `json:"retentionPeriod,omitempty"`
+}
+
+// BadgerConfig represents BadgerDB-specific configuration
+type BadgerConfig struct {
+	MaxFileSizeMB int  `json:"maxFileSizeMB,omitempty"`
+	Indexing      bool `json:"indexing,omitempty"`
+}
+
+// FrostDBConfig represents FrostDB-specific configuration
+type FrostDBConfig struct {
+	BatchSize       int    `json:"batchSize,omitempty"`
+	FlushInterval   string `json:"flushInterval,omitempty"`
+	ActiveMemoryMB  int    `json:"activeMemoryMB,omitempty"`
+	WALEnabled      bool   `json:"walEnabled,omitempty"`
+	UseSettingsFrom string `json:"useSettingsFrom,omitempty"`
+	RetentionPeriod string `json:"retentionPeriod,omitempty"`
+	Indexing        bool   `json:"indexing,omitempty"`
+}
+
 // MetricsStorageConfig represents the metrics storage configuration
 type MetricsStorageConfig struct {
-	Engine          string      `json:"engine"`
-	DataPath        string      `json:"dataPath"`
-	RetentionPeriod string      `json:"retentionPeriod"`
-	IndexConfig     IndexConfig `json:"indexConfig"`
+	Engine   *EngineConfig `json:"engine"`
+	DataPath string        `json:"dataPath"`
 }
 
 // LogsStorageConfig represents the logs storage configuration
 type LogsStorageConfig struct {
-	Engine        string `json:"engine"`
-	DataPath      string `json:"dataPath"`
-	Indexing      bool   `json:"indexing"`
-	MaxFileSizeMB int    `json:"maxFileSizeMB"`
+	Engine   *EngineConfig `json:"engine"`
+	DataPath string        `json:"dataPath"`
 }
 
 // TracesStorageConfig represents the traces storage configuration
 type TracesStorageConfig struct {
-	Engine          string `json:"engine"`
-	DataPath        string `json:"dataPath"`
-	RetentionPeriod string `json:"retentionPeriod"`
-}
-
-// IndexConfig represents the index configuration
-type IndexConfig struct {
-	BlockSize  string `json:"blockSize"`
-	Compaction bool   `json:"compaction"`
+	Engine   *EngineConfig `json:"engine"`
+	DataPath string        `json:"dataPath"`
 }
 
 // DashboardConfig represents the dashboard configuration section
@@ -172,12 +287,49 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("traces data path is required")
 	}
 
-	// Validate retention periods
-	if _, err := parseDuration(config.Storage.Metrics.RetentionPeriod); err != nil {
-		return fmt.Errorf("invalid metrics retention period: %w", err)
+	// Validate retention periods if specified
+	if config.Storage.Metrics.Engine != nil {
+		var retentionPeriod string
+
+		// Check retention period based on engine type
+		switch config.Storage.Metrics.Engine.Type {
+		case "tsdb":
+			if config.Storage.Metrics.Engine.TSDBConfig != nil {
+				retentionPeriod = config.Storage.Metrics.Engine.TSDBConfig.RetentionPeriod
+			}
+		case "frostdb":
+			if config.Storage.Metrics.Engine.FrostDBConfig != nil {
+				retentionPeriod = config.Storage.Metrics.Engine.FrostDBConfig.RetentionPeriod
+			}
+		}
+
+		if retentionPeriod != "" {
+			if _, err := parseDuration(retentionPeriod); err != nil {
+				return fmt.Errorf("invalid metrics retention period: %w", err)
+			}
+		}
 	}
-	if _, err := parseDuration(config.Storage.Traces.RetentionPeriod); err != nil {
-		return fmt.Errorf("invalid traces retention period: %w", err)
+
+	if config.Storage.Traces.Engine != nil {
+		var retentionPeriod string
+
+		// Check retention period based on engine type
+		switch config.Storage.Traces.Engine.Type {
+		case "tsdb":
+			if config.Storage.Traces.Engine.TSDBConfig != nil {
+				retentionPeriod = config.Storage.Traces.Engine.TSDBConfig.RetentionPeriod
+			}
+		case "frostdb":
+			if config.Storage.Traces.Engine.FrostDBConfig != nil {
+				retentionPeriod = config.Storage.Traces.Engine.FrostDBConfig.RetentionPeriod
+			}
+		}
+
+		if retentionPeriod != "" {
+			if _, err := parseDuration(retentionPeriod); err != nil {
+				return fmt.Errorf("invalid traces retention period: %w", err)
+			}
+		}
 	}
 
 	// Validate ingestion endpoints

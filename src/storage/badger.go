@@ -2,7 +2,6 @@ package storage
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -146,6 +145,7 @@ func (s *BadgerStore) QueryLogs(query *LogQuery) ([]*LogEntry, error) {
 				continue
 			}
 
+			// Add to results
 			results = append(results, &entry)
 
 			// Limit results if specified
@@ -153,7 +153,6 @@ func (s *BadgerStore) QueryLogs(query *LogQuery) ([]*LogEntry, error) {
 				break
 			}
 		}
-
 		return nil
 	})
 
@@ -164,21 +163,9 @@ func (s *BadgerStore) QueryLogs(query *LogQuery) ([]*LogEntry, error) {
 	return results, nil
 }
 
-// LogQuery defines the parameters for querying logs
-type LogQuery struct {
-	StartTime time.Time
-	EndTime   time.Time
-	Filter    func(*LogEntry) bool
-	Limit     int
-}
-
 // generateLogKey generates a key for a log entry based on timestamp
 func (s *BadgerStore) generateLogKey(timestamp time.Time) []byte {
-	// Key format: "log_" + timestamp (nanoseconds since epoch)
-	key := make([]byte, 4+8) // 4 bytes for prefix "log_" and 8 bytes for timestamp
-	copy(key[0:], []byte("log_"))
-	binary.BigEndian.PutUint64(key[4:], uint64(timestamp.UnixNano()))
-	return key
+	return []byte(fmt.Sprintf("log:%d", timestamp.UnixNano()))
 }
 
 // createIndexes creates indexes for log entry fields

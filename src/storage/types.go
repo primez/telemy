@@ -13,10 +13,20 @@ type DataPoint struct {
 
 // MetricQuery defines the parameters for querying metrics
 type MetricQuery struct {
-	StartTime   time.Time
-	EndTime     time.Time
-	LabelFilter func(map[string]string) bool
-	Limit       int
+	StartTime    time.Time
+	EndTime      time.Time
+	LabelFilter  func(map[string]string) bool
+	FilterLabels map[string]string // Labels to filter on directly in the database query
+	Limit        int
+}
+
+// LogQuery defines the parameters for querying logs
+type LogQuery struct {
+	StartTime time.Time
+	EndTime   time.Time
+	Filter    func(*LogEntry) bool
+	Level     string // Filter by specific log level
+	Limit     int
 }
 
 // MetricsStore interface for storing and querying metrics

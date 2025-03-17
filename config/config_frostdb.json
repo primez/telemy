@@ -14,29 +14,28 @@
   "storage": {
     "metrics": {
       "engine": {
-        "type": "tsdb",
-        "blockSize": "2h",
-        "compaction": true,
+        "type": "frostdb",
+        "batchSize": 10000,
+        "flushInterval": "15s",
+        "activeMemoryMB": 200,
+        "walEnabled": true,
         "retentionPeriod": "30d"
       },
-      "dataPath": "d:/Temp/telemy/data/tsdb_metrics"
+      "dataPath": "d:/Temp/telemy/data/frostdb"
     },
     "logs": {
       "engine": {
-        "type": "badger",
-        "maxFileSizeMB": 100,
-        "indexing": true
+        "type": "frostdb",
+        "useSettingsFrom": "metrics",
       },
-      "dataPath": "d:/Temp/telemy/data/badger_logs"
+      "dataPath": "d:/Temp/telemy/data/frostdb"
     },
     "traces": {
       "engine": {
-        "type": "tsdb",
-        "blockSize": "2h",
-        "compaction": true,
-        "retentionPeriod": "7d"
+        "type": "frostdb",
+        "useSettingsFrom": "metrics"
       },
-      "dataPath": "d:/Temp/telemy/data/tsdb_traces"
+      "dataPath": "d:/Temp/telemy/data/frostdb"
     }
   },
   "dashboard": {
@@ -60,55 +59,59 @@
         "type": "table",
         "title": "Recent Errors",
         "dataSource": "logs",
-        "query": "level=ERROR",
-        "refreshInterval": "30s",
-        "maxRows": 50
+        "query": "level=error",
+        "refreshInterval": "1m",
+        "maxRows": 10
       },
       {
-        "type": "table",
-        "title": "Recent Traces",
+        "type": "trace",
+        "title": "Transaction Traces",
         "dataSource": "traces",
-        "query": "",
-        "refreshInterval": "30s",
-        "maxRows": 20
+        "query": "transaction=checkout",
+        "refreshInterval": "1m"
       }
     ]
   },
   "aggregation": {
-    "functions": ["sum", "avg", "min", "max", "count"],
+    "functions": ["avg", "sum", "min", "max", "count"],
     "customAggregations": [
       {
-        "name": "error_rate",
-        "expression": "count(level=ERROR) / count(*)"
+        "name": "p95",
+        "expression": "percentile(value, 95)"
+      },
+      {
+        "name": "rate5m",
+        "expression": "rate(value[5m])"
       }
     ]
   },
   "alerts": {
     "email": {
-      "enabled": true,
+      "enabled": false,
       "smtpServer": "smtp.example.com",
       "smtpPort": 587,
       "username": "alerts@example.com",
       "password": "your-password",
       "fromAddress": "alerts@example.com",
-      "toAddresses": ["ops@example.com"],
+      "toAddresses": ["team@example.com"],
       "templates": {
-        "default": "Alert: {alertName} triggered at {timestamp}. Details: {details}"
+        "critical": "templates/critical-alert.html",
+        "warning": "templates/warning-alert.html"
       }
     },
     "rules": [
       {
-        "name": "HighCPUUsage",
+        "name": "High CPU Usage",
         "dataSource": "metrics",
-        "query": "__name__=cpu_usage > 80",
+        "query": "__name__=cpu_usage > 90",
         "duration": "5m",
         "severity": "critical"
       },
       {
-        "name": "HighErrorRate",
+        "name": "High Error Rate",
         "dataSource": "logs",
-        "query": "level=ERROR",
-        "duration": "10m",
+        "query": "level=error",
+        "duration": "15m",
         "severity": "warning"
       }
     ]
