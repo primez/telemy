@@ -164,7 +164,6 @@ type FrostDBConfig struct {
 	FlushInterval   string `json:"flushInterval,omitempty"`
 	ActiveMemoryMB  int    `json:"activeMemoryMB,omitempty"`
 	WALEnabled      bool   `json:"walEnabled,omitempty"`
-	UseSettingsFrom string `json:"useSettingsFrom,omitempty"`
 	RetentionPeriod string `json:"retentionPeriod,omitempty"`
 	Indexing        bool   `json:"indexing,omitempty"`
 }

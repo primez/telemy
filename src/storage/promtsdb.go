@@ -94,8 +94,7 @@ func (s *PromTSDBStore) QueryMetrics(query *MetricQuery) ([]*DataPoint, error) {
 	defer s.mu.RUnlock()
 
 	// Create Prometheus querier
-	ctx := context.Background()
-	querier, err := s.db.Querier(ctx, query.StartTime.UnixMilli(), query.EndTime.UnixMilli())
+	querier, err := s.db.Querier(query.StartTime.UnixMilli(), query.EndTime.UnixMilli())
 	if err != nil {
 		return nil, fmt.Errorf("error creating querier: %v", err)
 	}
@@ -122,7 +121,8 @@ func (s *PromTSDBStore) QueryMetrics(query *MetricQuery) ([]*DataPoint, error) {
 	matchers = append(matchers, serviceMatcher)
 
 	// Query the TSDB
-	seriesSet := querier.Select(false, hints, matchers...)
+	ctx := context.Background()
+	seriesSet := querier.Select(ctx, false, hints, matchers...)
 
 	// Process results
 	var results []*DataPoint

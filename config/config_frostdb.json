@@ -15,27 +15,35 @@
     "metrics": {
       "engine": {
         "type": "frostdb",
-        "batchSize": 10000,
+        "batchSize": 1000,
         "flushInterval": "15s",
-        "activeMemoryMB": 200,
+        "activeMemoryMB": 30,
         "walEnabled": true,
-        "retentionPeriod": "30d"
+        "retentionPeriod": "7d"
       },
-      "dataPath": "d:/Temp/telemy/data/frostdb"
+      "dataPath": "d:/Temp/telemy/metrics"
     },
     "logs": {
       "engine": {
         "type": "frostdb",
-        "useSettingsFrom": "metrics",
+        "batchSize": 500,
+        "flushInterval": "30s",
+        "activeMemoryMB": 50,
+        "walEnabled": true,
+        "retentionPeriod": "4d"
       },
-      "dataPath": "d:/Temp/telemy/data/frostdb"
+      "dataPath": "d:/Temp/telemy/logs"
     },
     "traces": {
       "engine": {
         "type": "frostdb",
-        "useSettingsFrom": "metrics"
+        "batchSize": 600,
+        "flushInterval": "30s",
+        "activeMemoryMB": 30,
+        "walEnabled": true,
+        "retentionPeriod": "4d"
       },
-      "dataPath": "d:/Temp/telemy/data/frostdb"
+      "dataPath": "d:/Temp/telemy/traces"
     }
   },
   "dashboard": {

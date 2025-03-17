@@ -37,10 +37,24 @@ func NewManager(cfg config.IngestionConfig, storageManager *storage.Manager) (*M
 		storageManager: storageManager,
 	}
 
-	// Initialize handlers
-	manager.metricsHandler = NewMetricsHandler(storageManager.MetricsStore())
-	manager.logsHandler = NewLogsHandler(storageManager.LogsStore())
-	manager.tracesHandler = NewTracesHandler(storageManager.TracesStore())
+	// Initialize handlers with type assertions
+	metricsStore, ok := storageManager.MetricsStore().(*storage.PromTSDBStore)
+	if !ok {
+		return nil, fmt.Errorf("expected metrics store to be *storage.PromTSDBStore")
+	}
+	manager.metricsHandler = NewMetricsHandler(metricsStore)
+
+	logsStore, ok := storageManager.LogsStore().(*storage.BadgerStore)
+	if !ok {
+		return nil, fmt.Errorf("expected logs store to be *storage.BadgerStore")
+	}
+	manager.logsHandler = NewLogsHandler(logsStore)
+
+	tracesStore, ok := storageManager.TracesStore().(*storage.PromTSDBStore)
+	if !ok {
+		return nil, fmt.Errorf("expected traces store to be *storage.PromTSDBStore")
+	}
+	manager.tracesHandler = NewTracesHandler(tracesStore)
 
 	return manager, nil
 }

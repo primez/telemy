@@ -47,134 +47,200 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 
 	// Check if using FrostDB or the original storage engines
 	if cfg.Metrics.Engine != nil && cfg.Metrics.Engine.Type == "frostdb" {
-		// Use FrostDB for all storage types
-		log.Println("Using FrostDB for all storage types")
+		// Using FrostDB, but with separate instances for each telemetry type
+		log.Println("Using FrostDB with separate instances for each telemetry type")
 
-		// Initialize FrostDB storage
-		frostdbPath := resolvePath(filepath.Join(filepath.Dir(cfg.Metrics.DataPath), "frostdb"))
-		if err := ensureDir(frostdbPath); err != nil {
-			return nil, fmt.Errorf("failed to create FrostDB data directory: %w", err)
-		}
+		// Process metrics storage
+		if cfg.Metrics.Engine != nil && cfg.Metrics.Engine.Type == "frostdb" &&
+			cfg.Metrics.Engine.FrostDBConfig != nil {
+			metricsPath := resolvePath(cfg.Metrics.DataPath)
+			if err := ensureDir(metricsPath); err != nil {
+				return nil, fmt.Errorf("failed to create metrics data directory: %w", err)
+			}
 
-		// Get FrostDB config and determine which one to use as the primary
-		var primaryConfig *config.FrostDBConfig
-		var primarySource string
-		var retention time.Duration
-		var retentionSource string
+			// Configure metrics FrostDB options
+			metricsOptions := DefaultFrostDBOptions()
 
-		// First check if logs or traces have UseSettingsFrom set
-		var logsUseSettingsFrom string
-		var tracesUseSettingsFrom string
+			// Apply metrics configuration
+			if cfg.Metrics.Engine.FrostDBConfig.BatchSize > 0 {
+				metricsOptions.BatchSize = cfg.Metrics.Engine.FrostDBConfig.BatchSize
+				log.Printf("Metrics FrostDB batch size: %d", metricsOptions.BatchSize)
+			}
 
-		if cfg.Logs.Engine != nil && cfg.Logs.Engine.Type == "frostdb" &&
-			cfg.Logs.Engine.FrostDBConfig != nil {
-			logsUseSettingsFrom = cfg.Logs.Engine.FrostDBConfig.UseSettingsFrom
-		}
+			if cfg.Metrics.Engine.FrostDBConfig.FlushInterval != "" {
+				flushInterval, err := parseDuration(cfg.Metrics.Engine.FrostDBConfig.FlushInterval)
+				if err != nil {
+					return nil, fmt.Errorf("invalid metrics FrostDB flush interval: %w", err)
+				}
+				metricsOptions.FlushInterval = flushInterval
+				log.Printf("Metrics FrostDB flush interval: %s", metricsOptions.FlushInterval)
+			}
 
-		if cfg.Traces.Engine != nil && cfg.Traces.Engine.Type == "frostdb" &&
-			cfg.Traces.Engine.FrostDBConfig != nil {
-			tracesUseSettingsFrom = cfg.Traces.Engine.FrostDBConfig.UseSettingsFrom
-		}
+			if cfg.Metrics.Engine.FrostDBConfig.ActiveMemoryMB > 0 {
+				metricsOptions.ActiveMemorySize = int64(cfg.Metrics.Engine.FrostDBConfig.ActiveMemoryMB) * 1024 * 1024
+				log.Printf("Metrics FrostDB active memory size: %d MB", cfg.Metrics.Engine.FrostDBConfig.ActiveMemoryMB)
+			}
 
-		// Determine which config to use as primary
-		if cfg.Metrics.Engine.FrostDBConfig != nil {
-			primaryConfig = cfg.Metrics.Engine.FrostDBConfig
-			primarySource = "metrics"
+			if cfg.Metrics.Engine.FrostDBConfig.WALEnabled != metricsOptions.WALEnabled {
+				metricsOptions.WALEnabled = cfg.Metrics.Engine.FrostDBConfig.WALEnabled
+				log.Printf("Metrics FrostDB WAL enabled: %v", metricsOptions.WALEnabled)
+			}
 
-			// Get retention from metrics
-			if primaryConfig.RetentionPeriod != "" {
+			// Get metrics retention period
+			var metricsRetention time.Duration
+			if cfg.Metrics.Engine.FrostDBConfig.RetentionPeriod != "" {
 				var err error
-				retention, err = parseDuration(primaryConfig.RetentionPeriod)
+				metricsRetention, err = parseDuration(cfg.Metrics.Engine.FrostDBConfig.RetentionPeriod)
 				if err != nil {
 					return nil, fmt.Errorf("invalid metrics retention period: %w", err)
 				}
-				retentionSource = "metrics"
+			} else {
+				// Default retention if not specified
+				metricsRetention = 30 * 24 * time.Hour // 30 days
 			}
-		}
+			log.Printf("Metrics retention period: %v", metricsRetention)
 
-		// Check if logs should be primary
-		if logsUseSettingsFrom == "" && tracesUseSettingsFrom == "logs" {
-			if cfg.Logs.Engine != nil && cfg.Logs.Engine.Type == "frostdb" &&
-				cfg.Logs.Engine.FrostDBConfig != nil {
-				primaryConfig = cfg.Logs.Engine.FrostDBConfig
-				primarySource = "logs"
-			}
-		}
+			// Set metrics-specific options
+			metricsOptions.TableName = "metrics"
 
-		// Check if traces should be primary
-		if tracesUseSettingsFrom == "" &&
-			(logsUseSettingsFrom == "traces" || primarySource == "") {
-			if cfg.Traces.Engine != nil && cfg.Traces.Engine.Type == "frostdb" &&
-				cfg.Traces.Engine.FrostDBConfig != nil {
-				primaryConfig = cfg.Traces.Engine.FrostDBConfig
-				primarySource = "traces"
-
-				// Get retention from traces
-				if primaryConfig.RetentionPeriod != "" && retentionSource == "" {
-					var err error
-					retention, err = parseDuration(primaryConfig.RetentionPeriod)
-					if err != nil {
-						return nil, fmt.Errorf("invalid traces retention period: %w", err)
-					}
-					retentionSource = "traces"
-				}
-			}
-		}
-
-		// If no primary config was found, use default settings
-		if primaryConfig == nil {
-			log.Println("No FrostDB configuration found, using defaults")
-			primaryConfig = &config.FrostDBConfig{}
-		} else {
-			log.Printf("Using FrostDB configuration from %s section", primarySource)
-		}
-
-		// Default retention if not specified
-		if retention == 0 {
-			retention = 30 * 24 * time.Hour // 30 days default
-			log.Printf("No retention period specified, using default: %v", retention)
-		} else {
-			log.Printf("Using retention period from %s: %v", retentionSource, retention)
-		}
-
-		// Configure FrostDB options
-		frostdbOptions := DefaultFrostDBOptions()
-
-		// Apply custom configuration from the primary config
-		if primaryConfig.BatchSize > 0 {
-			frostdbOptions.BatchSize = primaryConfig.BatchSize
-			log.Printf("Using FrostDB batch size: %d", frostdbOptions.BatchSize)
-		}
-
-		if primaryConfig.FlushInterval != "" {
-			flushInterval, err := parseDuration(primaryConfig.FlushInterval)
+			// Create metrics FrostDB store
+			metricsStore, err := NewFrostDBStore(metricsPath, metricsRetention, metricsOptions)
 			if err != nil {
-				return nil, fmt.Errorf("invalid FrostDB flush interval: %w", err)
+				return nil, fmt.Errorf("failed to initialize metrics FrostDB storage: %w", err)
 			}
-			frostdbOptions.FlushInterval = flushInterval
-			log.Printf("Using FrostDB flush interval: %s", frostdbOptions.FlushInterval)
+			manager.metricsStore = metricsStore
 		}
 
-		if primaryConfig.ActiveMemoryMB > 0 {
-			frostdbOptions.ActiveMemorySize = int64(primaryConfig.ActiveMemoryMB) * 1024 * 1024 // Convert to bytes
-			log.Printf("Using FrostDB active memory size: %d MB", primaryConfig.ActiveMemoryMB)
+		// Process logs storage
+		if cfg.Logs.Engine != nil && cfg.Logs.Engine.Type == "frostdb" &&
+			cfg.Logs.Engine.FrostDBConfig != nil {
+			logsPath := resolvePath(cfg.Logs.DataPath)
+			if err := ensureDir(logsPath); err != nil {
+				return nil, fmt.Errorf("failed to create logs data directory: %w", err)
+			}
+
+			// Configure logs FrostDB options
+			logsOptions := DefaultFrostDBOptions()
+
+			// Apply logs configuration
+			if cfg.Logs.Engine.FrostDBConfig.BatchSize > 0 {
+				logsOptions.BatchSize = cfg.Logs.Engine.FrostDBConfig.BatchSize
+				log.Printf("Logs FrostDB batch size: %d", logsOptions.BatchSize)
+			}
+
+			if cfg.Logs.Engine.FrostDBConfig.FlushInterval != "" {
+				flushInterval, err := parseDuration(cfg.Logs.Engine.FrostDBConfig.FlushInterval)
+				if err != nil {
+					return nil, fmt.Errorf("invalid logs FrostDB flush interval: %w", err)
+				}
+				logsOptions.FlushInterval = flushInterval
+				log.Printf("Logs FrostDB flush interval: %s", logsOptions.FlushInterval)
+			}
+
+			if cfg.Logs.Engine.FrostDBConfig.ActiveMemoryMB > 0 {
+				logsOptions.ActiveMemorySize = int64(cfg.Logs.Engine.FrostDBConfig.ActiveMemoryMB) * 1024 * 1024
+				log.Printf("Logs FrostDB active memory size: %d MB", cfg.Logs.Engine.FrostDBConfig.ActiveMemoryMB)
+			}
+
+			if cfg.Logs.Engine.FrostDBConfig.WALEnabled != logsOptions.WALEnabled {
+				logsOptions.WALEnabled = cfg.Logs.Engine.FrostDBConfig.WALEnabled
+				log.Printf("Logs FrostDB WAL enabled: %v", logsOptions.WALEnabled)
+			}
+
+			// Get logs retention period
+			var logsRetention time.Duration
+			if cfg.Logs.Engine.FrostDBConfig.RetentionPeriod != "" {
+				var err error
+				logsRetention, err = parseDuration(cfg.Logs.Engine.FrostDBConfig.RetentionPeriod)
+				if err != nil {
+					return nil, fmt.Errorf("invalid logs retention period: %w", err)
+				}
+			} else {
+				// Default retention if not specified
+				logsRetention = 14 * 24 * time.Hour // 14 days
+			}
+			log.Printf("Logs retention period: %v", logsRetention)
+
+			// Set logs-specific options
+			logsOptions.TableName = "logs"
+
+			// Create logs FrostDB store
+			logsStore, err := NewFrostDBStore(logsPath, logsRetention, logsOptions)
+			if err != nil {
+				if manager.metricsStore != nil {
+					manager.metricsStore.Close()
+				}
+				return nil, fmt.Errorf("failed to initialize logs FrostDB storage: %w", err)
+			}
+			manager.logsStore = logsStore
 		}
 
-		// Only apply WAL config if explicitly set (maintain backward compatibility)
-		if primaryConfig.WALEnabled != frostdbOptions.WALEnabled {
-			frostdbOptions.WALEnabled = primaryConfig.WALEnabled
-			log.Printf("FrostDB WAL enabled: %v", frostdbOptions.WALEnabled)
-		}
+		// Process traces storage
+		if cfg.Traces.Engine != nil && cfg.Traces.Engine.Type == "frostdb" &&
+			cfg.Traces.Engine.FrostDBConfig != nil {
+			tracesPath := resolvePath(cfg.Traces.DataPath)
+			if err := ensureDir(tracesPath); err != nil {
+				return nil, fmt.Errorf("failed to create traces data directory: %w", err)
+			}
 
-		frostStore, err := NewFrostDBStore(frostdbPath, retention, frostdbOptions)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize FrostDB storage: %w", err)
-		}
+			// Configure traces FrostDB options
+			tracesOptions := DefaultFrostDBOptions()
 
-		// Use the same store for all three types
-		manager.metricsStore = frostStore
-		manager.logsStore = frostStore
-		manager.tracesStore = frostStore
+			// Apply traces configuration
+			if cfg.Traces.Engine.FrostDBConfig.BatchSize > 0 {
+				tracesOptions.BatchSize = cfg.Traces.Engine.FrostDBConfig.BatchSize
+				log.Printf("Traces FrostDB batch size: %d", tracesOptions.BatchSize)
+			}
+
+			if cfg.Traces.Engine.FrostDBConfig.FlushInterval != "" {
+				flushInterval, err := parseDuration(cfg.Traces.Engine.FrostDBConfig.FlushInterval)
+				if err != nil {
+					return nil, fmt.Errorf("invalid traces FrostDB flush interval: %w", err)
+				}
+				tracesOptions.FlushInterval = flushInterval
+				log.Printf("Traces FrostDB flush interval: %s", tracesOptions.FlushInterval)
+			}
+
+			if cfg.Traces.Engine.FrostDBConfig.ActiveMemoryMB > 0 {
+				tracesOptions.ActiveMemorySize = int64(cfg.Traces.Engine.FrostDBConfig.ActiveMemoryMB) * 1024 * 1024
+				log.Printf("Traces FrostDB active memory size: %d MB", cfg.Traces.Engine.FrostDBConfig.ActiveMemoryMB)
+			}
+
+			if cfg.Traces.Engine.FrostDBConfig.WALEnabled != tracesOptions.WALEnabled {
+				tracesOptions.WALEnabled = cfg.Traces.Engine.FrostDBConfig.WALEnabled
+				log.Printf("Traces FrostDB WAL enabled: %v", tracesOptions.WALEnabled)
+			}
+
+			// Get traces retention period
+			var tracesRetention time.Duration
+			if cfg.Traces.Engine.FrostDBConfig.RetentionPeriod != "" {
+				var err error
+				tracesRetention, err = parseDuration(cfg.Traces.Engine.FrostDBConfig.RetentionPeriod)
+				if err != nil {
+					return nil, fmt.Errorf("invalid traces retention period: %w", err)
+				}
+			} else {
+				// Default retention if not specified
+				tracesRetention = 7 * 24 * time.Hour // 7 days
+			}
+			log.Printf("Traces retention period: %v", tracesRetention)
+
+			// Set traces-specific options
+			tracesOptions.TableName = "traces"
+
+			// Create traces FrostDB store
+			tracesStore, err := NewFrostDBStore(tracesPath, tracesRetention, tracesOptions)
+			if err != nil {
+				if manager.metricsStore != nil {
+					manager.metricsStore.Close()
+				}
+				if manager.logsStore != nil {
+					manager.logsStore.Close()
+				}
+				return nil, fmt.Errorf("failed to initialize traces FrostDB storage: %w", err)
+			}
+			manager.tracesStore = tracesStore
+		}
 	} else {
 		// Use original storage engines (TSDB and BadgerDB)
 		log.Println("Using original storage engines (TSDB and BadgerDB)")

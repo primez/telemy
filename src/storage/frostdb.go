@@ -47,6 +47,7 @@ type FrostDBOptions struct {
 	FlushInterval    time.Duration
 	ActiveMemorySize int64
 	WALEnabled       bool
+	TableName        string
 }
 
 // DefaultFrostDBOptions returns default options for FrostDB
@@ -56,14 +57,16 @@ func DefaultFrostDBOptions() *FrostDBOptions {
 		FlushInterval:    30 * time.Second,
 		ActiveMemorySize: 100 * frostdb.MiB,
 		WALEnabled:       true,
+		TableName:        "data", // Default table name
 	}
 }
 
-// FrostDBStore implements MetricsStore, LogsStore, and TracesStore interfaces using FrostDB
+// FrostDBStore implements either MetricsStore, LogsStore, or TracesStore interface using FrostDB
 type FrostDBStore struct {
 	columnstore *frostdb.ColumnStore
 	database    *frostdb.DB
-	tables      map[string]*frostdb.Table
+	table       *frostdb.Table
+	tableName   string
 	path        string
 	retention   time.Duration
 
@@ -71,17 +74,9 @@ type FrostDBStore struct {
 	queryEngine *query.LocalEngine
 
 	// Batching support
-	metricBatch     dynparquet.Samples
-	metricBatchSize int
-	metricBatchMu   sync.Mutex
-
-	logBatch     dynparquet.Samples
-	logBatchSize int
-	logBatchMu   sync.Mutex
-
-	traceBatch     dynparquet.Samples
-	traceBatchSize int
-	traceBatchMu   sync.Mutex
+	batch     dynparquet.Samples
+	batchSize int
+	batchMu   sync.Mutex
 
 	batchMaxSize  int
 	flushTicker   *time.Ticker
@@ -112,17 +107,17 @@ func NewFrostDBStore(path string, retention time.Duration, opts *FrostDBOptions)
 	indexConfig := []*index.LevelConfig{
 		{
 			Level:   index.L0,
-			MaxSize: 100 * frostdb.MiB,
+			MaxSize: 50 * frostdb.MiB,
 			Type:    index.CompactionTypeParquetDisk,
 		},
 		{
 			Level:   index.L1,
-			MaxSize: 200 * frostdb.MiB,
+			MaxSize: 100 * frostdb.MiB,
 			Type:    index.CompactionTypeParquetDisk,
 		},
 		{
 			Level:   index.L2,
-			MaxSize: 500 * frostdb.MiB,
+			MaxSize: 250 * frostdb.MiB,
 		},
 	}
 
@@ -133,7 +128,7 @@ func NewFrostDBStore(path string, retention time.Duration, opts *FrostDBOptions)
 		frostdb.WithActiveMemorySize(opts.ActiveMemorySize),
 		frostdb.WithRegistry(registry),
 		frostdb.WithIndexConfig(indexConfig),
-		frostdb.WithSnapshotTriggerSize(100 * frostdb.MiB),
+		frostdb.WithSnapshotTriggerSize(50 * frostdb.MiB),
 	}
 
 	// Add WAL if enabled
@@ -162,21 +157,19 @@ func NewFrostDBStore(path string, retention time.Duration, opts *FrostDBOptions)
 		columnstore:   columnstore,
 		database:      database,
 		queryEngine:   engine,
-		tables:        make(map[string]*frostdb.Table),
+		tableName:     opts.TableName,
 		path:          path,
 		retention:     retention,
-		metricBatch:   dynparquet.Samples{},
-		logBatch:      dynparquet.Samples{},
-		traceBatch:    dynparquet.Samples{},
+		batch:         dynparquet.Samples{},
 		batchMaxSize:  opts.BatchSize,
 		flushInterval: opts.FlushInterval,
 		shutdown:      make(chan struct{}),
 	}
 
-	// Create tables
-	if err := store.initializeTables(); err != nil {
+	// Create table
+	if err := store.initializeTable(); err != nil {
 		columnstore.Close()
-		return nil, fmt.Errorf("failed to initialize tables: %w", err)
+		return nil, fmt.Errorf("failed to initialize table: %w", err)
 	}
 
 	// Start the background flush timer
@@ -191,160 +184,59 @@ func NewDefaultFrostDBStore(path string, retention time.Duration) (*FrostDBStore
 	return NewFrostDBStore(path, retention, nil)
 }
 
-// initializeTables creates the tables if they don't exist
-func (s *FrostDBStore) initializeTables() error {
+// initializeTable creates the table if it doesn't exist
+func (s *FrostDBStore) initializeTable() error {
+	// Create table config with schema (using the dynparquet sample definition)
+	schema := dynparquet.SampleDefinition()
+	config := frostdb.NewTableConfig(schema)
+
+	// Create table
 	var err error
-
-	// Create metrics table config with schema
-	metricsSchema := dynparquet.SampleDefinition()
-	metricsConfig := frostdb.NewTableConfig(metricsSchema)
-
-	// Create metrics table
-	s.tables["metrics"], err = s.database.Table("metrics", metricsConfig)
+	s.table, err = s.database.Table(s.tableName, config)
 	if err != nil {
-		return fmt.Errorf("failed to create metrics table: %w", err)
-	}
-
-	// Create logs table config with schema
-	logsSchema := dynparquet.SampleDefinition()
-	logsConfig := frostdb.NewTableConfig(logsSchema)
-
-	// Create logs table
-	s.tables["logs"], err = s.database.Table("logs", logsConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create logs table: %w", err)
-	}
-
-	// Create traces table config with schema
-	tracesSchema := dynparquet.SampleDefinition()
-	tracesConfig := frostdb.NewTableConfig(tracesSchema)
-
-	// Create traces table
-	s.tables["traces"], err = s.database.Table("traces", tracesConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create traces table: %w", err)
+		return fmt.Errorf("failed to create table %s: %w", s.tableName, err)
 	}
 
 	return nil
 }
 
-// flushRoutine periodically flushes batches to storage
+// flushRoutine periodically flushes batch to storage
 func (s *FrostDBStore) flushRoutine() {
 	for {
 		select {
 		case <-s.flushTicker.C:
-			s.FlushMetricBatch()
-			s.FlushLogBatch()
-			s.FlushTraceBatch()
+			s.FlushBatch()
 		case <-s.shutdown:
 			return
 		}
 	}
 }
 
-// FlushMetricBatch flushes the current metric batch to storage
-func (s *FrostDBStore) FlushMetricBatch() {
-	s.metricBatchMu.Lock()
-	defer s.metricBatchMu.Unlock()
+// FlushBatch flushes the current batch to storage
+func (s *FrostDBStore) FlushBatch() {
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
 
-	if len(s.metricBatch) == 0 {
+	if len(s.batch) == 0 {
 		return // Nothing to flush
 	}
 
-	// Get the metrics table
-	table, ok := s.tables["metrics"]
-	if !ok {
-		// Just log the error since we can't propagate it
-		fmt.Println("Error: metrics table not found during flush")
-		return
-	}
-
 	// Convert batch to record
-	record, err := s.metricBatch.ToRecord()
+	record, err := s.batch.ToRecord()
 	if err != nil {
-		fmt.Printf("Error creating record during metric batch flush: %v\n", err)
+		fmt.Printf("Error creating record during batch flush: %v\n", err)
 		return
 	}
 
 	// Insert the record
-	if _, err := table.InsertRecord(context.Background(), record); err != nil {
-		fmt.Printf("Error inserting record during metric batch flush: %v\n", err)
+	if _, err := s.table.InsertRecord(context.Background(), record); err != nil {
+		fmt.Printf("Error inserting record during batch flush: %v\n", err)
 		return
 	}
 
 	// Clear the batch
-	s.metricBatch = dynparquet.Samples{}
-	s.metricBatchSize = 0
-}
-
-// FlushLogBatch flushes the current log batch to storage
-func (s *FrostDBStore) FlushLogBatch() {
-	s.logBatchMu.Lock()
-	defer s.logBatchMu.Unlock()
-
-	if len(s.logBatch) == 0 {
-		return // Nothing to flush
-	}
-
-	// Get the logs table
-	table, ok := s.tables["logs"]
-	if !ok {
-		// Just log the error since we can't propagate it
-		fmt.Println("Error: logs table not found during flush")
-		return
-	}
-
-	// Convert batch to record
-	record, err := s.logBatch.ToRecord()
-	if err != nil {
-		fmt.Printf("Error creating record during log batch flush: %v\n", err)
-		return
-	}
-
-	// Insert the record
-	if _, err := table.InsertRecord(context.Background(), record); err != nil {
-		fmt.Printf("Error inserting record during log batch flush: %v\n", err)
-		return
-	}
-
-	// Clear the batch
-	s.logBatch = dynparquet.Samples{}
-	s.logBatchSize = 0
-}
-
-// FlushTraceBatch flushes the current trace batch to storage
-func (s *FrostDBStore) FlushTraceBatch() {
-	s.traceBatchMu.Lock()
-	defer s.traceBatchMu.Unlock()
-
-	if len(s.traceBatch) == 0 {
-		return // Nothing to flush
-	}
-
-	// Get the traces table
-	table, ok := s.tables["traces"]
-	if !ok {
-		// Just log the error since we can't propagate it
-		fmt.Println("Error: traces table not found during flush")
-		return
-	}
-
-	// Convert batch to record
-	record, err := s.traceBatch.ToRecord()
-	if err != nil {
-		fmt.Printf("Error creating record during trace batch flush: %v\n", err)
-		return
-	}
-
-	// Insert the record
-	if _, err := table.InsertRecord(context.Background(), record); err != nil {
-		fmt.Printf("Error inserting record during trace batch flush: %v\n", err)
-		return
-	}
-
-	// Clear the batch
-	s.traceBatch = dynparquet.Samples{}
-	s.traceBatchSize = 0
+	s.batch = dynparquet.Samples{}
+	s.batchSize = 0
 }
 
 // Close closes the FrostDB database
@@ -356,9 +248,7 @@ func (s *FrostDBStore) Close() error {
 	}
 
 	// Flush any remaining data
-	s.FlushMetricBatch()
-	s.FlushLogBatch()
-	s.FlushTraceBatch()
+	s.FlushBatch()
 
 	if s.columnstore != nil {
 		return s.columnstore.Close()
@@ -376,18 +266,18 @@ func (s *FrostDBStore) StoreMetric(point *DataPoint) error {
 	}
 
 	// Add to batch
-	s.metricBatchMu.Lock()
-	defer s.metricBatchMu.Unlock()
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
 
-	s.metricBatch = append(s.metricBatch, sample)
-	s.metricBatchSize++
+	s.batch = append(s.batch, sample)
+	s.batchSize++
 
 	// If batch is full, flush it
-	if s.metricBatchSize >= s.batchMaxSize {
+	if s.batchSize >= s.batchMaxSize {
 		// To avoid deferring the mutex unlock until after the flush,
 		// we'll create a goroutine to do the flush
 		go func() {
-			s.FlushMetricBatch()
+			s.FlushBatch()
 		}()
 	}
 
@@ -415,8 +305,8 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 
 	// Start building the filter expression with timestamp range
 	filterExpr := logicalplan.And(
-		logicalplan.Col("timestamp").GtEq(logicalplan.Literal(startTime)), // Use GtEq instead of Gt to include exact start time
-		logicalplan.Col("timestamp").LtEq(logicalplan.Literal(endTime)),   // Use LtEq instead of Lt to include exact end time
+		logicalplan.Col("timestamp").GtEq(logicalplan.Literal(startTime)),
+		logicalplan.Col("timestamp").LtEq(logicalplan.Literal(endTime)),
 	)
 
 	// If we have specific label filters that can be pushed down to FrostDB, add them
@@ -431,7 +321,7 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 	}
 
 	// Build and execute the query using the reused query engine
-	scanner := s.queryEngine.ScanTable("metrics").
+	scanner := s.queryEngine.ScanTable(s.tableName).
 		Filter(filterExpr).
 		Project(
 			logicalplan.Col("timestamp"),
@@ -493,7 +383,6 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 	}
 
 	// Apply any additional complex label filtering that couldn't be pushed down
-	// This handles cases where the LabelFilter is a custom function that can't be expressed in FrostDB query language
 	if metricQuery.LabelFilter != nil {
 		filteredPoints := make([]*DataPoint, 0, len(dataPoints))
 		for _, point := range dataPoints {
@@ -523,18 +412,18 @@ func (s *FrostDBStore) StoreLog(entry *LogEntry) error {
 	sample.Labels["message"] = entry.Message
 
 	// Add to batch
-	s.logBatchMu.Lock()
-	defer s.logBatchMu.Unlock()
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
 
-	s.logBatch = append(s.logBatch, sample)
-	s.logBatchSize++
+	s.batch = append(s.batch, sample)
+	s.batchSize++
 
 	// If batch is full, flush it
-	if s.logBatchSize >= s.batchMaxSize {
+	if s.batchSize >= s.batchMaxSize {
 		// To avoid deferring the mutex unlock until after the flush,
 		// we'll create a goroutine to do the flush
 		go func() {
-			s.FlushLogBatch()
+			s.FlushBatch()
 		}()
 	}
 
@@ -573,7 +462,7 @@ func (s *FrostDBStore) QueryLogs(logQuery *LogQuery) ([]*LogEntry, error) {
 	}
 
 	// Build and execute the query using the reused query engine
-	scanner := s.queryEngine.ScanTable("logs").
+	scanner := s.queryEngine.ScanTable(s.tableName).
 		Filter(filterExpr).
 		Project(
 			logicalplan.Col("timestamp"),
@@ -675,18 +564,18 @@ func (s *FrostDBStore) StoreTrace(point *DataPoint) error {
 	}
 
 	// Add to batch
-	s.traceBatchMu.Lock()
-	defer s.traceBatchMu.Unlock()
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
 
-	s.traceBatch = append(s.traceBatch, sample)
-	s.traceBatchSize++
+	s.batch = append(s.batch, sample)
+	s.batchSize++
 
 	// If batch is full, flush it
-	if s.traceBatchSize >= s.batchMaxSize {
+	if s.batchSize >= s.batchMaxSize {
 		// To avoid deferring the mutex unlock until after the flush,
 		// we'll create a goroutine to do the flush
 		go func() {
-			s.FlushTraceBatch()
+			s.FlushBatch()
 		}()
 	}
 
@@ -720,7 +609,6 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 
 	// If we have specific label filters that can be pushed down to FrostDB, add them
 	if len(metricQuery.FilterLabels) > 0 {
-		// Build a series of label equality filters for the specified labels
 		for key, value := range metricQuery.FilterLabels {
 			labelPath := fmt.Sprintf("labels.%s", key)
 			labelExpr := logicalplan.Col(labelPath).Eq(logicalplan.Literal(value))
@@ -731,7 +619,7 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 	}
 
 	// Build and execute the query using the reused query engine
-	scanner := s.queryEngine.ScanTable("traces").
+	scanner := s.queryEngine.ScanTable(s.tableName).
 		Filter(filterExpr).
 		Project(
 			logicalplan.Col("timestamp"),
@@ -793,7 +681,6 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 	}
 
 	// Apply any additional complex label filtering that couldn't be pushed down
-	// This handles cases where the LabelFilter is a custom function that can't be expressed in FrostDB query language
 	if metricQuery.LabelFilter != nil {
 		filteredPoints := make([]*DataPoint, 0, len(dataPoints))
 		for _, point := range dataPoints {
