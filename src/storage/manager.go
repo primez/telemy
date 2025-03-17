@@ -41,9 +41,9 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 	}
 
 	// Log the data directories once
-	log.Printf("Metrics data path: %s", resolvePath(cfg.Metrics.DataPath))
-	log.Printf("Logs data path: %s", resolvePath(cfg.Logs.DataPath))
-	log.Printf("Traces data path: %s", resolvePath(cfg.Traces.DataPath))
+	log.Printf("Metrics data path: %s", resolvePath(cfg.Metrics.DataPath, "metrics"))
+	log.Printf("Logs data path: %s", resolvePath(cfg.Logs.DataPath, "logs"))
+	log.Printf("Traces data path: %s", resolvePath(cfg.Traces.DataPath, "traces"))
 
 	// Check if using FrostDB or the original storage engines
 	if cfg.Metrics.Engine != nil && cfg.Metrics.Engine.Type == "frostdb" {
@@ -53,7 +53,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 		// Process metrics storage
 		if cfg.Metrics.Engine != nil && cfg.Metrics.Engine.Type == "frostdb" &&
 			cfg.Metrics.Engine.FrostDBConfig != nil {
-			metricsPath := resolvePath(cfg.Metrics.DataPath)
+			metricsPath := resolvePath(cfg.Metrics.DataPath, "metrics")
 			if err := ensureDir(metricsPath); err != nil {
 				return nil, fmt.Errorf("failed to create metrics data directory: %w", err)
 			}
@@ -114,7 +114,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 		// Process logs storage
 		if cfg.Logs.Engine != nil && cfg.Logs.Engine.Type == "frostdb" &&
 			cfg.Logs.Engine.FrostDBConfig != nil {
-			logsPath := resolvePath(cfg.Logs.DataPath)
+			logsPath := resolvePath(cfg.Logs.DataPath, "logs")
 			if err := ensureDir(logsPath); err != nil {
 				return nil, fmt.Errorf("failed to create logs data directory: %w", err)
 			}
@@ -178,7 +178,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 		// Process traces storage
 		if cfg.Traces.Engine != nil && cfg.Traces.Engine.Type == "frostdb" &&
 			cfg.Traces.Engine.FrostDBConfig != nil {
-			tracesPath := resolvePath(cfg.Traces.DataPath)
+			tracesPath := resolvePath(cfg.Traces.DataPath, "traces")
 			if err := ensureDir(tracesPath); err != nil {
 				return nil, fmt.Errorf("failed to create traces data directory: %w", err)
 			}
@@ -276,7 +276,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 			metricsCompaction = true
 		}
 
-		metricsPath := resolvePath(cfg.Metrics.DataPath)
+		metricsPath := resolvePath(cfg.Metrics.DataPath, "metrics")
 		metricsStore, err := NewPromTSDBStore(metricsPath, metricsRetention, metricsBlockSize, metricsCompaction)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize metrics storage: %w", err)
@@ -284,7 +284,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 		manager.metricsStore = metricsStore
 
 		// Initialize logs storage
-		logsPath := resolvePath(cfg.Logs.DataPath)
+		logsPath := resolvePath(cfg.Logs.DataPath, "logs")
 		var logsIndexing bool
 		var logsMaxFileSizeMB int
 
@@ -305,7 +305,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 		manager.logsStore = logsStore
 
 		// Initialize traces storage
-		tracesPath := resolvePath(cfg.Traces.DataPath)
+		tracesPath := resolvePath(cfg.Traces.DataPath, "traces")
 		var tracesRetention time.Duration
 
 		if cfg.Traces.Engine != nil && cfg.Traces.Engine.Type == "tsdb" && cfg.Traces.Engine.TSDBConfig != nil &&
@@ -392,12 +392,12 @@ func (m *Manager) TracesStore() TracesStore {
 
 // ensureDir ensures that the specified directory exists
 func ensureDir(path string) error {
-	resolvedPath := resolvePath(path)
+	resolvedPath := resolvePath(path, "directory creation")
 	return os.MkdirAll(resolvedPath, 0755)
 }
 
 // resolvePath resolves a path relative to the application root directory
-func resolvePath(path string) string {
+func resolvePath(path string, context string) string {
 	// Already absolute, return as is
 	if filepath.IsAbs(path) {
 		return path
@@ -425,9 +425,9 @@ func resolvePath(path string) string {
 	// Combine the app root with the relative path
 	resolvedPath := filepath.Join(appRoot, path)
 
-	// Only log when converting relative paths
+	// Only log when converting relative paths and include context
 	if originalPath != resolvedPath {
-		log.Printf("Resolved path: %s -> %s", originalPath, resolvedPath)
+		log.Printf("Resolved path (%s): %s -> %s", context, originalPath, resolvedPath)
 	}
 
 	return resolvedPath
