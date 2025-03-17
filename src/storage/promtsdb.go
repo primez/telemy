@@ -193,3 +193,13 @@ func (s *PromTSDBStore) QueryMetrics(query *MetricQuery) ([]*DataPoint, error) {
 
 	return results, nil
 }
+
+// StoreTrace stores a trace data point (implements TracesStore interface)
+func (s *PromTSDBStore) StoreTrace(point *DataPoint) error {
+	return s.StoreMetric(point)
+}
+
+// QueryTraces queries traces based on criteria (implements TracesStore interface)
+func (s *PromTSDBStore) QueryTraces(query *MetricQuery) ([]*DataPoint, error) {
+	return s.QueryMetrics(query)
+}

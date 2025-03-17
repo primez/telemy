@@ -15,9 +15,9 @@ import (
 // Manager manages storage for metrics, logs, and traces
 type Manager struct {
 	config       config.StorageConfig
-	metricsStore *PromTSDBStore
-	logsStore    *BadgerStore
-	tracesStore  *PromTSDBStore
+	metricsStore MetricsStore
+	logsStore    LogsStore
+	tracesStore  TracesStore
 	mu           sync.RWMutex
 }
 
@@ -45,47 +45,78 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 	log.Printf("Logs data path: %s", resolvePath(cfg.Logs.DataPath))
 	log.Printf("Traces data path: %s", resolvePath(cfg.Traces.DataPath))
 
-	// Initialize metrics storage
-	metricsRetention, err := parseDuration(cfg.Metrics.RetentionPeriod)
-	if err != nil {
-		return nil, fmt.Errorf("invalid metrics retention period: %w", err)
-	}
-	metricsBlockSize, err := parseDuration(cfg.Metrics.IndexConfig.BlockSize)
-	if err != nil {
-		return nil, fmt.Errorf("invalid metrics block size: %w", err)
-	}
-	metricsPath := resolvePath(cfg.Metrics.DataPath)
-	metricsStore, err := NewPromTSDBStore(metricsPath, metricsRetention, metricsBlockSize, cfg.Metrics.IndexConfig.Compaction)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize metrics storage: %w", err)
-	}
-	manager.metricsStore = metricsStore
+	// Check if using FrostDB or the original storage engines
+	if cfg.Metrics.Engine == "frostdb" {
+		// Use FrostDB for all storage types
+		log.Println("Using FrostDB for all storage types")
 
-	// Initialize logs storage
-	logsPath := resolvePath(cfg.Logs.DataPath)
-	logsStore, err := NewBadgerStore(logsPath, cfg.Logs.Indexing, cfg.Logs.MaxFileSizeMB)
-	if err != nil {
-		metricsStore.Close()
-		return nil, fmt.Errorf("failed to initialize logs storage: %w", err)
-	}
-	manager.logsStore = logsStore
+		// Initialize FrostDB storage
+		frostdbPath := resolvePath(filepath.Join(filepath.Dir(cfg.Metrics.DataPath), "frostdb"))
+		if err := ensureDir(frostdbPath); err != nil {
+			return nil, fmt.Errorf("failed to create FrostDB data directory: %w", err)
+		}
 
-	// Initialize traces storage
-	tracesRetention, err := parseDuration(cfg.Traces.RetentionPeriod)
-	if err != nil {
-		metricsStore.Close()
-		logsStore.Close()
-		return nil, fmt.Errorf("invalid traces retention period: %w", err)
+		// Create shared FrostDB instance
+		retention, err := parseDuration(cfg.Metrics.RetentionPeriod)
+		if err != nil {
+			return nil, fmt.Errorf("invalid retention period: %w", err)
+		}
+
+		frostStore, err := NewFrostDBStore(frostdbPath, retention)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize FrostDB storage: %w", err)
+		}
+
+		// Use the same store for all three types
+		manager.metricsStore = frostStore
+		manager.logsStore = frostStore
+		manager.tracesStore = frostStore
+	} else {
+		// Use original storage engines (TSDB and BadgerDB)
+		log.Println("Using original storage engines (TSDB and BadgerDB)")
+
+		// Initialize metrics storage
+		metricsRetention, err := parseDuration(cfg.Metrics.RetentionPeriod)
+		if err != nil {
+			return nil, fmt.Errorf("invalid metrics retention period: %w", err)
+		}
+		metricsBlockSize, err := parseDuration(cfg.Metrics.IndexConfig.BlockSize)
+		if err != nil {
+			return nil, fmt.Errorf("invalid metrics block size: %w", err)
+		}
+		metricsPath := resolvePath(cfg.Metrics.DataPath)
+		metricsStore, err := NewPromTSDBStore(metricsPath, metricsRetention, metricsBlockSize, cfg.Metrics.IndexConfig.Compaction)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize metrics storage: %w", err)
+		}
+		manager.metricsStore = metricsStore
+
+		// Initialize logs storage
+		logsPath := resolvePath(cfg.Logs.DataPath)
+		logsStore, err := NewBadgerStore(logsPath, cfg.Logs.Indexing, cfg.Logs.MaxFileSizeMB)
+		if err != nil {
+			metricsStore.Close()
+			return nil, fmt.Errorf("failed to initialize logs storage: %w", err)
+		}
+		manager.logsStore = logsStore
+
+		// Initialize traces storage
+		tracesRetention, err := parseDuration(cfg.Traces.RetentionPeriod)
+		if err != nil {
+			metricsStore.Close()
+			logsStore.Close()
+			return nil, fmt.Errorf("invalid traces retention period: %w", err)
+		}
+		// Assume 2h block size for traces, similar to metrics
+		tracesPath := resolvePath(cfg.Traces.DataPath)
+		tracesStore, err := NewPromTSDBStore(tracesPath, tracesRetention, 2*time.Hour, true)
+		if err != nil {
+			metricsStore.Close()
+			logsStore.Close()
+			return nil, fmt.Errorf("failed to initialize traces storage: %w", err)
+		}
+		manager.tracesStore = tracesStore
 	}
-	// Assume 2h block size for traces, similar to metrics
-	tracesPath := resolvePath(cfg.Traces.DataPath)
-	tracesStore, err := NewPromTSDBStore(tracesPath, tracesRetention, 2*time.Hour, true)
-	if err != nil {
-		metricsStore.Close()
-		logsStore.Close()
-		return nil, fmt.Errorf("failed to initialize traces storage: %w", err)
-	}
-	manager.tracesStore = tracesStore
 
 	return manager, nil
 }
@@ -129,21 +160,21 @@ func (m *Manager) Close() error {
 }
 
 // MetricsStore returns the metrics store
-func (m *Manager) MetricsStore() *PromTSDBStore {
+func (m *Manager) MetricsStore() MetricsStore {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.metricsStore
 }
 
 // LogsStore returns the logs store
-func (m *Manager) LogsStore() *BadgerStore {
+func (m *Manager) LogsStore() LogsStore {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.logsStore
 }
 
 // TracesStore returns the traces store
-func (m *Manager) TracesStore() *PromTSDBStore {
+func (m *Manager) TracesStore() TracesStore {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.tracesStore
