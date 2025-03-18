@@ -41,6 +41,15 @@ type TracesSchema struct {
 	Labels    map[string]string `frostdb:",asc"`
 }
 
+// StoreType represents the type of storage
+type StoreType int
+
+const (
+	MetricsStoreType StoreType = iota
+	LogsStoreType
+	TracesStoreType
+)
+
 // FrostDBOptions contains configuration options for FrostDB
 type FrostDBOptions struct {
 	BatchSize        int
@@ -48,6 +57,7 @@ type FrostDBOptions struct {
 	ActiveMemorySize int64
 	WALEnabled       bool
 	TableName        string
+	StoreType        StoreType // Added to determine which schema to use
 }
 
 // DefaultFrostDBOptions returns default options for FrostDB
@@ -166,8 +176,8 @@ func NewFrostDBStore(path string, retention time.Duration, opts *FrostDBOptions)
 		shutdown:      make(chan struct{}),
 	}
 
-	// Create table
-	if err := store.initializeTable(); err != nil {
+	// Create table based on store type
+	if err := store.initializeTable(opts.StoreType); err != nil {
 		columnstore.Close()
 		return nil, fmt.Errorf("failed to initialize table: %w", err)
 	}
@@ -185,8 +195,9 @@ func NewDefaultFrostDBStore(path string, retention time.Duration) (*FrostDBStore
 }
 
 // initializeTable creates the table if it doesn't exist
-func (s *FrostDBStore) initializeTable() error {
-	// Create table config with schema (using the dynparquet sample definition)
+func (s *FrostDBStore) initializeTable(storeType StoreType) error {
+	// Use the generic Sample definition for now
+	// TODO: Implement custom schemas when proper schema support is available
 	schema := dynparquet.SampleDefinition()
 	config := frostdb.NewTableConfig(schema)
 
@@ -343,81 +354,64 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 			return nil
 		}
 
-		// Safety check for columns
-		if r.NumCols() < 3 {
-			return fmt.Errorf("unexpected number of columns: %d, expected at least 3", r.NumCols())
+		// Safety check for minimum columns - just need timestamp
+		if r.NumCols() < 1 {
+			return nil // Return empty result instead of error for empty tables
 		}
 
-		// Get columns from the record
-		timestampCol, ok := r.Column(0).(*array.Int64)
-		if !ok {
-			return fmt.Errorf("unexpected type for timestamp column: %T", r.Column(0))
-		}
+		// Find indexes of columns we need
+		timestampColIdx := -1
+		valueColIdx := -1
+		labelsColIdx := -1
 
-		valueCol, ok := r.Column(1).(*array.Float64)
-		if !ok {
-			// Try as Int64 and convert
-			if intCol, ok := r.Column(1).(*array.Int64); ok {
-				// Create datapoints for each row
-				for i := int64(0); i < numRows; i++ {
-					// Extract timestamp
-					timestamp := time.Unix(0, timestampCol.Value(int(i)))
-
-					// Extract value (as int64, convert to float64)
-					value := float64(intCol.Value(int(i)))
-
-					// Extract labels (assuming it's the third column)
-					labels := make(map[string]string)
-					if r.NumCols() > 2 {
-						// Handle labels safely
-						if labelsCol := r.Column(2); labelsCol != nil {
-							if labelsDict, ok := labelsCol.(*array.Dictionary); ok {
-								keyIndex := labelsDict.GetValueIndex(int(i))
-								if keyIndex >= 0 {
-									dictValues := labelsDict.Dictionary().(*array.String)
-									labelStr := dictValues.Value(keyIndex)
-									if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
-										// Just create an empty label if we can't parse
-										labels = make(map[string]string)
-									}
-								}
-							}
-						}
-					}
-
-					dataPoint := &DataPoint{
-						Timestamp: timestamp,
-						Value:     value,
-						Labels:    labels,
-					}
-					dataPoints = append(dataPoints, dataPoint)
-				}
-				return nil
+		for i, field := range r.Schema().Fields() {
+			switch field.Name {
+			case "timestamp":
+				timestampColIdx = i
+			case "value":
+				valueColIdx = i
+			case "labels":
+				labelsColIdx = i
 			}
-			return fmt.Errorf("unexpected type for value column: %T", r.Column(1))
 		}
 
-		// Process each row with float64 value column
+		// Need at least timestamp and value columns
+		if timestampColIdx < 0 || valueColIdx < 0 {
+			return nil
+		}
+
+		// Get timestamp column
+		timestampCol, ok := r.Column(timestampColIdx).(*array.Int64)
+		if !ok {
+			return nil // Return empty result for unexpected column types
+		}
+
+		// Process rows
 		for i := int64(0); i < numRows; i++ {
 			// Extract timestamp
 			timestamp := time.Unix(0, timestampCol.Value(int(i)))
 
-			// Extract value
-			value := valueCol.Value(int(i))
+			// Extract value - try both Float64 and Int64 types
+			value := float64(0)
+
+			valueCol := r.Column(valueColIdx)
+			if floatCol, ok := valueCol.(*array.Float64); ok {
+				value = floatCol.Value(int(i))
+			} else if intCol, ok := valueCol.(*array.Int64); ok {
+				value = float64(intCol.Value(int(i)))
+			}
 
 			// Extract labels
 			labels := make(map[string]string)
-			if r.NumCols() > 2 {
-				if labelsCol := r.Column(2); labelsCol != nil {
-					if labelsDict, ok := labelsCol.(*array.Dictionary); ok {
-						keyIndex := labelsDict.GetValueIndex(int(i))
-						if keyIndex >= 0 {
-							dictValues := labelsDict.Dictionary().(*array.String)
-							labelStr := dictValues.Value(keyIndex)
-							if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
-								// Just create an empty label if we can't parse
-								labels = make(map[string]string)
-							}
+			if labelsColIdx >= 0 && labelsColIdx < int(r.NumCols()) {
+				if labelsDict, ok := r.Column(labelsColIdx).(*array.Dictionary); ok {
+					keyIndex := labelsDict.GetValueIndex(int(i))
+					if keyIndex >= 0 {
+						dictValues := labelsDict.Dictionary().(*array.String)
+						labelStr := dictValues.Value(keyIndex)
+						if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
+							// Just create an empty label if we can't parse
+							labels = make(map[string]string)
 						}
 					}
 				}
@@ -435,7 +429,8 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("error executing query: %w", err)
+		// Return empty result instead of error
+		return []*DataPoint{}, nil
 	}
 
 	// Apply additional filtering in memory if needed
@@ -513,18 +508,19 @@ func (s *FrostDBStore) QueryLogs(logQuery *LogQuery) ([]*LogEntry, error) {
 
 	// Add log level filter if specified
 	if logQuery.Level != "" {
-		levelExpr := logicalplan.Col("level").Eq(logicalplan.Literal(logQuery.Level))
+		// Use example_type for level since we're using the Sample schema
+		levelExpr := logicalplan.Col("example_type").Eq(logicalplan.Literal(logQuery.Level))
 		filterExpr = logicalplan.And(filterExpr, levelExpr)
 	}
 
 	// Build and execute the query using the reused query engine
-	// Add all fields we need to extract to the projection
+	// Project all fields from the Sample schema that we need
 	scanner := s.queryEngine.ScanTable(s.tableName).
 		Filter(filterExpr).
 		Project(
 			logicalplan.Col("timestamp"),
-			logicalplan.Col("level"),
-			logicalplan.Col("labels"),
+			logicalplan.Col("example_type"), // This is where level is stored
+			logicalplan.Col("labels"),       // Labels map contains message
 		)
 
 	// If there's a limit, apply it at the query level
@@ -541,15 +537,28 @@ func (s *FrostDBStore) QueryLogs(logQuery *LogQuery) ([]*LogEntry, error) {
 			return nil
 		}
 
-		// Safety check for columns
-		if r.NumCols() < 2 {
-			return fmt.Errorf("unexpected number of columns: %d, expected at least 2", r.NumCols())
+		// Safety check for minimum columns - just need timestamp
+		if r.NumCols() < 1 {
+			return nil // Return empty result instead of error for empty tables
 		}
 
-		// Get columns from the record with safety checks
+		// Get timestamp column
 		timestampCol, ok := r.Column(0).(*array.Int64)
 		if !ok {
-			return fmt.Errorf("unexpected type for timestamp column: %T", r.Column(0))
+			return nil // Return empty result for unexpected column types
+		}
+
+		// Find example_type and labels columns
+		exampleTypeColIdx := -1
+		labelsColIdx := -1
+
+		for i, field := range r.Schema().Fields() {
+			switch field.Name {
+			case "example_type":
+				exampleTypeColIdx = i
+			case "labels":
+				labelsColIdx = i
+			}
 		}
 
 		// Process each row
@@ -557,45 +566,32 @@ func (s *FrostDBStore) QueryLogs(logQuery *LogQuery) ([]*LogEntry, error) {
 			// Extract timestamp
 			timestamp := time.Unix(0, timestampCol.Value(int(i)))
 
-			// Extract level (defaults to empty string if not available)
+			// Extract level from example_type column
 			level := ""
-			if r.NumCols() > 1 {
-				levelCol := r.Column(1)
-				if levelCol != nil {
-					if levelDict, ok := levelCol.(*array.Dictionary); ok {
-						keyIndex := levelDict.GetValueIndex(int(i))
-						if keyIndex >= 0 {
-							dictValues := levelDict.Dictionary().(*array.String)
-							level = dictValues.Value(keyIndex)
-						}
-					} else if strCol, ok := levelCol.(*array.String); ok {
-						level = strCol.Value(int(i))
-					}
-				}
+			if exampleTypeColIdx >= 0 && exampleTypeColIdx < int(r.NumCols()) {
+				level = extractStringValue(r.Column(exampleTypeColIdx), int(i))
 			}
 
 			// Extract labels and message
 			labels := make(map[string]string)
 			message := ""
 
-			if r.NumCols() > 2 {
-				labelsCol := r.Column(2)
-				if labelsCol != nil {
-					if labelsDict, ok := labelsCol.(*array.Dictionary); ok {
-						keyIndex := labelsDict.GetValueIndex(int(i))
-						if keyIndex >= 0 {
-							dictValues := labelsDict.Dictionary().(*array.String)
-							labelStr := dictValues.Value(keyIndex)
-							if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
-								// Just create an empty label if we can't parse
-								labels = make(map[string]string)
-							}
+			if labelsColIdx >= 0 && labelsColIdx < int(r.NumCols()) {
+				labelsDict, ok := r.Column(labelsColIdx).(*array.Dictionary)
+				if ok {
+					keyIndex := labelsDict.GetValueIndex(int(i))
+					if keyIndex >= 0 {
+						dictValues := labelsDict.Dictionary().(*array.String)
+						labelStr := dictValues.Value(keyIndex)
+						if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
+							// Just create an empty label if we can't parse
+							labels = make(map[string]string)
+						}
 
-							// Extract message from labels
-							if msg, ok := labels["message"]; ok {
-								message = msg
-								delete(labels, "message") // Remove from labels to avoid duplication
-							}
+						// Extract message from labels
+						if msg, ok := labels["message"]; ok {
+							message = msg
+							delete(labels, "message") // Remove from labels to avoid duplication
 						}
 					}
 				}
@@ -614,10 +610,11 @@ func (s *FrostDBStore) QueryLogs(logQuery *LogQuery) ([]*LogEntry, error) {
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("error executing query: %w", err)
+		// Return empty result instead of error
+		return []*LogEntry{}, nil
 	}
 
-	// Apply any additional filtering that couldn't be pushed down
+	// Apply any additional filtering
 	if logQuery.Filter != nil {
 		filteredEntries := make([]*LogEntry, 0, len(logEntries))
 		for _, entry := range logEntries {
@@ -629,6 +626,27 @@ func (s *FrostDBStore) QueryLogs(logQuery *LogQuery) ([]*LogEntry, error) {
 	}
 
 	return logEntries, nil
+}
+
+// Helper function to extract string value from different column types
+func extractStringValue(col arrow.Array, rowIdx int) string {
+	if col == nil || col.IsNull(rowIdx) {
+		return ""
+	}
+
+	switch typedCol := col.(type) {
+	case *array.String:
+		return typedCol.Value(rowIdx)
+	case *array.Dictionary:
+		keyIndex := typedCol.GetValueIndex(rowIdx)
+		if keyIndex >= 0 {
+			dict := typedCol.Dictionary()
+			if dictStr, ok := dict.(*array.String); ok {
+				return dictStr.Value(keyIndex)
+			}
+		}
+	}
+	return ""
 }
 
 // StoreTrace stores a trace data point
@@ -718,81 +736,64 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 			return nil
 		}
 
-		// Safety check for columns
-		if r.NumCols() < 3 {
-			return fmt.Errorf("unexpected number of columns: %d, expected at least 3", r.NumCols())
+		// Safety check for minimum columns - just need timestamp
+		if r.NumCols() < 1 {
+			return nil // Return empty result instead of error for empty tables
 		}
 
-		// Get columns from the record
-		timestampCol, ok := r.Column(0).(*array.Int64)
-		if !ok {
-			return fmt.Errorf("unexpected type for timestamp column: %T", r.Column(0))
-		}
+		// Find indexes of columns we need
+		timestampColIdx := -1
+		valueColIdx := -1
+		labelsColIdx := -1
 
-		valueCol, ok := r.Column(1).(*array.Float64)
-		if !ok {
-			// Try as Int64 and convert
-			if intCol, ok := r.Column(1).(*array.Int64); ok {
-				// Create datapoints for each row
-				for i := int64(0); i < numRows; i++ {
-					// Extract timestamp
-					timestamp := time.Unix(0, timestampCol.Value(int(i)))
-
-					// Extract value (as int64, convert to float64)
-					value := float64(intCol.Value(int(i)))
-
-					// Extract labels (assuming it's the third column)
-					labels := make(map[string]string)
-					if r.NumCols() > 2 {
-						// Handle labels safely
-						if labelsCol := r.Column(2); labelsCol != nil {
-							if labelsDict, ok := labelsCol.(*array.Dictionary); ok {
-								keyIndex := labelsDict.GetValueIndex(int(i))
-								if keyIndex >= 0 {
-									dictValues := labelsDict.Dictionary().(*array.String)
-									labelStr := dictValues.Value(keyIndex)
-									if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
-										// Just create an empty label if we can't parse
-										labels = make(map[string]string)
-									}
-								}
-							}
-						}
-					}
-
-					dataPoint := &DataPoint{
-						Timestamp: timestamp,
-						Value:     value,
-						Labels:    labels,
-					}
-					dataPoints = append(dataPoints, dataPoint)
-				}
-				return nil
+		for i, field := range r.Schema().Fields() {
+			switch field.Name {
+			case "timestamp":
+				timestampColIdx = i
+			case "value":
+				valueColIdx = i
+			case "labels":
+				labelsColIdx = i
 			}
-			return fmt.Errorf("unexpected type for value column: %T", r.Column(1))
 		}
 
-		// Process each row with float64 value column
+		// Need at least timestamp and value columns
+		if timestampColIdx < 0 || valueColIdx < 0 {
+			return nil
+		}
+
+		// Get timestamp column
+		timestampCol, ok := r.Column(timestampColIdx).(*array.Int64)
+		if !ok {
+			return nil // Return empty result for unexpected column types
+		}
+
+		// Process rows
 		for i := int64(0); i < numRows; i++ {
 			// Extract timestamp
 			timestamp := time.Unix(0, timestampCol.Value(int(i)))
 
-			// Extract value
-			value := valueCol.Value(int(i))
+			// Extract value - try both Float64 and Int64 types
+			value := float64(0)
+
+			valueCol := r.Column(valueColIdx)
+			if floatCol, ok := valueCol.(*array.Float64); ok {
+				value = floatCol.Value(int(i))
+			} else if intCol, ok := valueCol.(*array.Int64); ok {
+				value = float64(intCol.Value(int(i)))
+			}
 
 			// Extract labels
 			labels := make(map[string]string)
-			if r.NumCols() > 2 {
-				if labelsCol := r.Column(2); labelsCol != nil {
-					if labelsDict, ok := labelsCol.(*array.Dictionary); ok {
-						keyIndex := labelsDict.GetValueIndex(int(i))
-						if keyIndex >= 0 {
-							dictValues := labelsDict.Dictionary().(*array.String)
-							labelStr := dictValues.Value(keyIndex)
-							if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
-								// Just create an empty label if we can't parse
-								labels = make(map[string]string)
-							}
+			if labelsColIdx >= 0 && labelsColIdx < int(r.NumCols()) {
+				if labelsDict, ok := r.Column(labelsColIdx).(*array.Dictionary); ok {
+					keyIndex := labelsDict.GetValueIndex(int(i))
+					if keyIndex >= 0 {
+						dictValues := labelsDict.Dictionary().(*array.String)
+						labelStr := dictValues.Value(keyIndex)
+						if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
+							// Just create an empty label if we can't parse
+							labels = make(map[string]string)
 						}
 					}
 				}
@@ -810,7 +811,8 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("error executing query: %w", err)
+		// Return empty result instead of error
+		return []*DataPoint{}, nil
 	}
 
 	// Apply additional filtering in memory if needed

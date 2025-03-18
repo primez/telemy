@@ -102,6 +102,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 
 			// Set metrics-specific options
 			metricsOptions.TableName = "metrics"
+			metricsOptions.StoreType = MetricsStoreType
 
 			// Create metrics FrostDB store
 			metricsStore, err := NewFrostDBStore(metricsPath, metricsRetention, metricsOptions)
@@ -157,12 +158,13 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 				}
 			} else {
 				// Default retention if not specified
-				logsRetention = 14 * 24 * time.Hour // 14 days
+				logsRetention = 7 * 24 * time.Hour // 7 days
 			}
 			log.Printf("Logs retention period: %v", logsRetention)
 
 			// Set logs-specific options
 			logsOptions.TableName = "logs"
+			logsOptions.StoreType = LogsStoreType
 
 			// Create logs FrostDB store
 			logsStore, err := NewFrostDBStore(logsPath, logsRetention, logsOptions)
@@ -227,6 +229,7 @@ func NewManager(cfg config.StorageConfig) (*Manager, error) {
 
 			// Set traces-specific options
 			tracesOptions.TableName = "traces"
+			tracesOptions.StoreType = TracesStoreType
 
 			// Create traces FrostDB store
 			tracesStore, err := NewFrostDBStore(tracesPath, tracesRetention, tracesOptions)

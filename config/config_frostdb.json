@@ -21,7 +21,7 @@
         "walEnabled": true,
         "retentionPeriod": "7d"
       },
-      "dataPath": "d:/Temp/telemy/metrics"
+      "dataPath": "/mnt/d/Temp/telemy/metrics"
     },
     "logs": {
       "engine": {
@@ -32,7 +32,7 @@
         "walEnabled": true,
         "retentionPeriod": "4d"
       },
-      "dataPath": "d:/Temp/telemy/logs"
+      "dataPath": "/mnt/d/Temp/telemy/logs"
     },
     "traces": {
       "engine": {
@@ -43,7 +43,7 @@
         "walEnabled": true,
         "retentionPeriod": "4d"
       },
-      "dataPath": "d:/Temp/telemy/traces"
+      "dataPath": "/mnt/d/Temp/telemy/traces"
     }
   },
   "dashboard": {
