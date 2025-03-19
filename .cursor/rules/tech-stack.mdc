@@ -1,18 +1,17 @@
 ---
-description: Technical stack
-globs: *.*
-alwaysApply: false
+description: 
+globs: 
+alwaysApply: true
 ---
-# Technical stack
+### Technical Stack Instructions
+- Use Go (Golang) as the primary programming language.
+- Utilize TSDB, FrostDB and BadgerDB for data storage.
+- Implement gRPC for remote procedure calls.
+- Rely on HTTP (net/http) for web services.
+- Manage source control with Git.
+- Write unit tests using the Go unit-testing package.
 
-- Go (Golang)
-- TSDB (data storage)
-- gRPC
-- HTTP (net/http)
-- JSON (encoding/json)
-- Windows Service (golang.org/x/sys/windows/svc)
-- Chart.js (or an equivalent web visualization library)
-- SMTP (net/smtp)
-- OpenTelemetry Go SDK
-- Git
-- Go unit-testing package
+### Technical Stack Compliance Instructions
+- Adhere strictly to the established technology stack.
+- Do not introduce new technologies unless explicitly instructed.
+- Suggest alternative technologies only when beneficial and with explicit user confirmation.

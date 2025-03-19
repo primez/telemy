@@ -1,15 +1,12 @@
 ---
-description: Coding workflow preferences
-globs: *.*
-alwaysApply: false
+description: 
+globs: 
+alwaysApply: true
 ---
-# Coding workflow preferences
-
-- I use Windows to develop my application, so Linux commands do not work in here
-- Focus on the areas of code relevant to the task
-- Do not touch code that is unrelated to the task
-- Write thorough tests for all major functionality
-- Avoid making major changes to the patterns and architecture of how
-feature works, after it has shown to work well, unless explicitly
-instructed
-- Always think about what other methods and areas of code might be affected by code changes
+### Coding Workflow Instructions
+- Develop on Windows; do not rely on Linux commands.
+- Focus exclusively on the code areas related to the task.
+- Avoid modifying code that is unrelated to the task.
+- Write thorough tests for all major functionality.
+- Refrain from making significant changes to established patterns and architecture unless explicitly instructed.
+- Consider the impact of changes on other methods and code areas.

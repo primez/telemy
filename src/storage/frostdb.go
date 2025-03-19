@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -232,6 +233,8 @@ func (s *FrostDBStore) FlushBatch() {
 		return // Nothing to flush
 	}
 
+	log.Printf("DEBUG: Flushing batch with %d items for table %s", len(s.batch), s.tableName)
+
 	// Convert batch to record
 	record, err := s.batch.ToRecord()
 	if err != nil {
@@ -248,32 +251,34 @@ func (s *FrostDBStore) FlushBatch() {
 	// Clear the batch
 	s.batch = dynparquet.Samples{}
 	s.batchSize = 0
-}
 
-// Close closes the FrostDB database
-func (s *FrostDBStore) Close() error {
-	// Stop the flush ticker
-	if s.flushTicker != nil {
-		s.flushTicker.Stop()
-		close(s.shutdown)
-	}
-
-	// Flush any remaining data
-	s.FlushBatch()
-
-	if s.columnstore != nil {
-		return s.columnstore.Close()
-	}
-	return nil
+	log.Printf("DEBUG: Successfully flushed batch for table %s", s.tableName)
 }
 
 // StoreMetric stores a metric data point
-func (s *FrostDBStore) StoreMetric(point *DataPoint) error {
-	// Create a sample based on the FrostDB sample format
+func (s *FrostDBStore) StoreMetric(dataPoint *DataPoint) error {
+	log.Printf("DEBUG: Storing metric - time: %s, value: %f, labels: %v",
+		dataPoint.Timestamp.Format(time.RFC3339), dataPoint.Value, dataPoint.Labels)
+
+	// Create a copy of labels to prevent modification of the original
+	labels := make(map[string]string)
+	metricName := "unknown"
+
+	// Extract __name__ label to use as ExampleType
+	for k, v := range dataPoint.Labels {
+		if k == "__name__" {
+			metricName = v
+		} else {
+			labels[k] = v
+		}
+	}
+
+	// Create a sample using the correct FrostDB sample type
 	sample := dynparquet.Sample{
-		Timestamp: point.Timestamp.UnixNano(),
-		Value:     int64(point.Value), // Convert to int64 as per sample format
-		Labels:    point.Labels,
+		ExampleType: metricName, // Use __name__ as ExampleType
+		Timestamp:   dataPoint.Timestamp.UnixNano(),
+		Value:       int64(dataPoint.Value),
+		Labels:      labels,
 	}
 
 	// Add to batch
@@ -297,6 +302,8 @@ func (s *FrostDBStore) StoreMetric(point *DataPoint) error {
 
 // QueryMetrics queries metrics based on criteria
 func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, error) {
+	log.Printf("DEBUG: Starting QueryMetrics for table %s", s.tableName)
+
 	// Handle time range - use defaults if not provided
 	var startTime, endTime int64
 
@@ -314,6 +321,10 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 		endTime = metricQuery.EndTime.UnixNano()
 	}
 
+	log.Printf("DEBUG: Query time range: %s to %s",
+		time.Unix(0, startTime).Format(time.RFC3339),
+		time.Unix(0, endTime).Format(time.RFC3339))
+
 	// Start building the filter expression with timestamp range
 	filterExpr := logicalplan.And(
 		logicalplan.Col("timestamp").GtEq(logicalplan.Literal(startTime)),
@@ -323,26 +334,40 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 	// If we have specific label filters that can be pushed down to FrostDB, add them
 	if len(metricQuery.FilterLabels) > 0 {
 		for key, value := range metricQuery.FilterLabels {
-			labelPath := fmt.Sprintf("labels.%s", key)
-			labelExpr := logicalplan.Col(labelPath).Eq(logicalplan.Literal(value))
-
-			// Combine with the existing filter
-			filterExpr = logicalplan.And(filterExpr, labelExpr)
+			if key == "__name__" {
+				// Handle special __name__ label with direct comparison on example_type
+				// This is the crucial part - __name__ maps to example_type in FrostDB
+				labelExpr := logicalplan.Col("example_type").Eq(logicalplan.Literal(value))
+				filterExpr = logicalplan.And(filterExpr, labelExpr)
+				log.Printf("DEBUG: Added __name__ filter as example_type = %s", value)
+			} else {
+				// For regular labels, use the proper path format for querying labels
+				labelPath := fmt.Sprintf("labels.%s", key)
+				labelExpr := logicalplan.Col(labelPath).Eq(logicalplan.Literal(value))
+				filterExpr = logicalplan.And(filterExpr, labelExpr)
+				log.Printf("DEBUG: Added label filter: %s = %s", key, value)
+			}
 		}
 	}
 
+	// Debug print the final filter expression
+	log.Printf("DEBUG: Filter expression: %v", filterExpr)
+
 	// Build and execute the query using the reused query engine
+	// NOTE: We must request all fields we want to see in the results
 	scanner := s.queryEngine.ScanTable(s.tableName).
 		Filter(filterExpr).
 		Project(
 			logicalplan.Col("timestamp"),
 			logicalplan.Col("value"),
-			logicalplan.Col("labels"),
+			logicalplan.Col("example_type"), // Include example_type for the __name__ label
+			logicalplan.Col("labels"),       // Include labels column for all other labels
 		)
 
 	// If there's a limit, apply it at the query level
 	if metricQuery.Limit > 0 {
 		scanner = scanner.Limit(logicalplan.Literal(int64(metricQuery.Limit)))
+		log.Printf("DEBUG: Applied limit: %d", metricQuery.Limit)
 	}
 
 	var dataPoints []*DataPoint
@@ -351,38 +376,54 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 	err := scanner.Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
 		numRows := r.NumRows()
 		if numRows == 0 {
+			log.Printf("DEBUG: Query returned empty record (0 rows)")
 			return nil
 		}
 
+		log.Printf("DEBUG: Query returned record with %d rows and %d columns", numRows, r.NumCols())
+
+		// Print the schema to understand what we're getting
+		log.Printf("DEBUG: Record schema: %s", r.Schema())
+
 		// Safety check for minimum columns - just need timestamp
 		if r.NumCols() < 1 {
+			log.Printf("DEBUG: Record has insufficient columns (%d), expected at least 1", r.NumCols())
 			return nil // Return empty result instead of error for empty tables
 		}
 
 		// Find indexes of columns we need
 		timestampColIdx := -1
 		valueColIdx := -1
+		exampleTypeColIdx := -1
 		labelsColIdx := -1
 
 		for i, field := range r.Schema().Fields() {
+			log.Printf("DEBUG: Found column %d: %s of type %s", i, field.Name, field.Type)
 			switch field.Name {
 			case "timestamp":
 				timestampColIdx = i
 			case "value":
 				valueColIdx = i
+			case "example_type":
+				exampleTypeColIdx = i
 			case "labels":
 				labelsColIdx = i
 			}
 		}
 
-		// Need at least timestamp and value columns
-		if timestampColIdx < 0 || valueColIdx < 0 {
+		log.Printf("DEBUG: Column indexes - timestamp: %d, value: %d, example_type: %d, labels: %d",
+			timestampColIdx, valueColIdx, exampleTypeColIdx, labelsColIdx)
+
+		// Need at least timestamp
+		if timestampColIdx < 0 {
+			log.Printf("DEBUG: Missing required timestamp column")
 			return nil
 		}
 
 		// Get timestamp column
 		timestampCol, ok := r.Column(timestampColIdx).(*array.Int64)
 		if !ok {
+			log.Printf("DEBUG: Timestamp column is not Int64, got %T", r.Column(timestampColIdx))
 			return nil // Return empty result for unexpected column types
 		}
 
@@ -393,25 +434,41 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 
 			// Extract value - try both Float64 and Int64 types
 			value := float64(0)
-
-			valueCol := r.Column(valueColIdx)
-			if floatCol, ok := valueCol.(*array.Float64); ok {
-				value = floatCol.Value(int(i))
-			} else if intCol, ok := valueCol.(*array.Int64); ok {
-				value = float64(intCol.Value(int(i)))
+			if valueColIdx >= 0 {
+				valueCol := r.Column(valueColIdx)
+				if floatCol, ok := valueCol.(*array.Float64); ok {
+					value = floatCol.Value(int(i))
+				} else if intCol, ok := valueCol.(*array.Int64); ok {
+					value = float64(intCol.Value(int(i)))
+				}
 			}
 
-			// Extract labels
+			// Start building labels map
 			labels := make(map[string]string)
-			if labelsColIdx >= 0 && labelsColIdx < int(r.NumCols()) {
+
+			// Add metric name from example_type as __name__ label
+			if exampleTypeColIdx >= 0 {
+				if exampleType := extractStringValue(r.Column(exampleTypeColIdx), int(i)); exampleType != "" {
+					labels["__name__"] = exampleType
+				}
+			}
+
+			// Extract other labels from the labels map
+			if labelsColIdx >= 0 {
 				if labelsDict, ok := r.Column(labelsColIdx).(*array.Dictionary); ok {
 					keyIndex := labelsDict.GetValueIndex(int(i))
 					if keyIndex >= 0 {
 						dictValues := labelsDict.Dictionary().(*array.String)
 						labelStr := dictValues.Value(keyIndex)
-						if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
-							// Just create an empty label if we can't parse
-							labels = make(map[string]string)
+						// Parse extra labels if available
+						var extraLabels map[string]string
+						if err := json.Unmarshal([]byte(labelStr), &extraLabels); err != nil {
+							log.Printf("DEBUG: Error parsing labels JSON: %v", err)
+						} else {
+							// Merge extra labels into our labels map
+							for k, v := range extraLabels {
+								labels[k] = v
+							}
 						}
 					}
 				}
@@ -424,14 +481,23 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 				Labels:    labels,
 			}
 			dataPoints = append(dataPoints, dataPoint)
+
+			// Log a sample of data points (first few only)
+			if i < 3 {
+				log.Printf("DEBUG: Retrieved data point - time: %s, value: %f, labels: %v",
+					timestamp.Format(time.RFC3339), value, labels)
+			}
 		}
 		return nil
 	})
 
 	if err != nil {
+		log.Printf("DEBUG: Query execution error: %v", err)
 		// Return empty result instead of error
 		return []*DataPoint{}, nil
 	}
+
+	log.Printf("DEBUG: Query returned %d data points", len(dataPoints))
 
 	// Apply additional filtering in memory if needed
 	if metricQuery.LabelFilter != nil {
@@ -442,25 +508,29 @@ func (s *FrostDBStore) QueryMetrics(metricQuery *MetricQuery) ([]*DataPoint, err
 			}
 		}
 		dataPoints = filteredPoints
+		log.Printf("DEBUG: After label filtering: %d data points", len(dataPoints))
 	}
 
 	return dataPoints, nil
 }
 
 // StoreLog stores a log entry
-func (s *FrostDBStore) StoreLog(entry *LogEntry) error {
-	// Create a sample based on the FrostDB sample format
+func (s *FrostDBStore) StoreLog(logEntry *LogEntry) error {
+	log.Printf("DEBUG: Storing log - time: %s, level: %s, message: %s",
+		logEntry.Timestamp.Format(time.RFC3339), logEntry.Level, logEntry.Message)
+
+	// Create a sample using the correct FrostDB sample type
 	sample := dynparquet.Sample{
-		Timestamp:   entry.Timestamp.UnixNano(),
-		ExampleType: entry.Level,
-		Labels:      entry.Labels,
+		Timestamp:   logEntry.Timestamp.UnixNano(),
+		ExampleType: logEntry.Level,
+		Labels:      logEntry.Labels,
 	}
 
-	// Add message to labels since there's no direct message field in Sample
+	// Add message to the labels map
 	if sample.Labels == nil {
 		sample.Labels = make(map[string]string)
 	}
-	sample.Labels["message"] = entry.Message
+	sample.Labels["message"] = logEntry.Message
 
 	// Add to batch
 	s.batchMu.Lock()
@@ -651,11 +721,28 @@ func extractStringValue(col arrow.Array, rowIdx int) string {
 
 // StoreTrace stores a trace data point
 func (s *FrostDBStore) StoreTrace(point *DataPoint) error {
-	// Create a sample based on the FrostDB sample format
+	log.Printf("DEBUG: Storing trace - time: %s, value: %f, labels: %v",
+		point.Timestamp.Format(time.RFC3339), point.Value, point.Labels)
+
+	// Create a copy of labels to prevent modification of the original
+	labels := make(map[string]string)
+	traceName := "unknown"
+
+	// Extract __name__ label to use as ExampleType
+	for k, v := range point.Labels {
+		if k == "__name__" {
+			traceName = v
+		} else {
+			labels[k] = v
+		}
+	}
+
+	// Create a sample using the correct FrostDB sample type
 	sample := dynparquet.Sample{
-		Timestamp: point.Timestamp.UnixNano(),
-		Value:     int64(point.Value), // Convert to int64 as per sample format
-		Labels:    point.Labels,
+		ExampleType: traceName, // Use __name__ as ExampleType
+		Timestamp:   point.Timestamp.UnixNano(),
+		Value:       int64(point.Value),
+		Labels:      labels,
 	}
 
 	// Add to batch
@@ -679,6 +766,8 @@ func (s *FrostDBStore) StoreTrace(point *DataPoint) error {
 
 // QueryTraces queries traces based on criteria
 func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, error) {
+	log.Printf("DEBUG: Starting QueryTraces for table %s", s.tableName)
+
 	// Handle time range - use defaults if not provided
 	var startTime, endTime int64
 
@@ -696,6 +785,10 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 		endTime = metricQuery.EndTime.UnixNano()
 	}
 
+	log.Printf("DEBUG: Query time range: %s to %s",
+		time.Unix(0, startTime).Format(time.RFC3339),
+		time.Unix(0, endTime).Format(time.RFC3339))
+
 	// Start building the filter expression with timestamp range
 	filterExpr := logicalplan.And(
 		logicalplan.Col("timestamp").GtEq(logicalplan.Literal(startTime)),
@@ -705,13 +798,24 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 	// If we have specific label filters that can be pushed down to FrostDB, add them
 	if len(metricQuery.FilterLabels) > 0 {
 		for key, value := range metricQuery.FilterLabels {
-			labelPath := fmt.Sprintf("labels.%s", key)
-			labelExpr := logicalplan.Col(labelPath).Eq(logicalplan.Literal(value))
-
-			// Combine with the existing filter
-			filterExpr = logicalplan.And(filterExpr, labelExpr)
+			if key == "__name__" {
+				// Handle special __name__ label with direct comparison on example_type
+				// This is the crucial part - __name__ maps to example_type in FrostDB
+				labelExpr := logicalplan.Col("example_type").Eq(logicalplan.Literal(value))
+				filterExpr = logicalplan.And(filterExpr, labelExpr)
+				log.Printf("DEBUG: Added __name__ filter as example_type = %s", value)
+			} else {
+				// For regular labels, use the proper path format for querying labels
+				labelPath := fmt.Sprintf("labels.%s", key)
+				labelExpr := logicalplan.Col(labelPath).Eq(logicalplan.Literal(value))
+				filterExpr = logicalplan.And(filterExpr, labelExpr)
+				log.Printf("DEBUG: Added label filter: %s = %s", key, value)
+			}
 		}
 	}
+
+	// Debug print the final filter expression
+	log.Printf("DEBUG: Filter expression: %v", filterExpr)
 
 	// Build and execute the query using the reused query engine
 	scanner := s.queryEngine.ScanTable(s.tableName).
@@ -719,12 +823,14 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 		Project(
 			logicalplan.Col("timestamp"),
 			logicalplan.Col("value"),
-			logicalplan.Col("labels"),
+			logicalplan.Col("example_type"), // Include example_type for the __name__ label
+			logicalplan.Col("labels"),       // Include labels column for all other labels
 		)
 
 	// If there's a limit, apply it at the query level
 	if metricQuery.Limit > 0 {
 		scanner = scanner.Limit(logicalplan.Literal(int64(metricQuery.Limit)))
+		log.Printf("DEBUG: Applied limit: %d", metricQuery.Limit)
 	}
 
 	var dataPoints []*DataPoint
@@ -733,38 +839,54 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 	err := scanner.Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
 		numRows := r.NumRows()
 		if numRows == 0 {
+			log.Printf("DEBUG: Query returned empty record (0 rows)")
 			return nil
 		}
 
+		log.Printf("DEBUG: Query returned record with %d rows and %d columns", numRows, r.NumCols())
+
+		// Print the schema to understand what we're getting
+		log.Printf("DEBUG: Record schema: %s", r.Schema())
+
 		// Safety check for minimum columns - just need timestamp
 		if r.NumCols() < 1 {
+			log.Printf("DEBUG: Record has insufficient columns (%d), expected at least 1", r.NumCols())
 			return nil // Return empty result instead of error for empty tables
 		}
 
 		// Find indexes of columns we need
 		timestampColIdx := -1
 		valueColIdx := -1
+		exampleTypeColIdx := -1
 		labelsColIdx := -1
 
 		for i, field := range r.Schema().Fields() {
+			log.Printf("DEBUG: Found column %d: %s of type %s", i, field.Name, field.Type)
 			switch field.Name {
 			case "timestamp":
 				timestampColIdx = i
 			case "value":
 				valueColIdx = i
+			case "example_type":
+				exampleTypeColIdx = i
 			case "labels":
 				labelsColIdx = i
 			}
 		}
 
-		// Need at least timestamp and value columns
-		if timestampColIdx < 0 || valueColIdx < 0 {
+		log.Printf("DEBUG: Column indexes - timestamp: %d, value: %d, example_type: %d, labels: %d",
+			timestampColIdx, valueColIdx, exampleTypeColIdx, labelsColIdx)
+
+		// Need at least timestamp
+		if timestampColIdx < 0 {
+			log.Printf("DEBUG: Missing required timestamp column")
 			return nil
 		}
 
 		// Get timestamp column
 		timestampCol, ok := r.Column(timestampColIdx).(*array.Int64)
 		if !ok {
+			log.Printf("DEBUG: Timestamp column is not Int64, got %T", r.Column(timestampColIdx))
 			return nil // Return empty result for unexpected column types
 		}
 
@@ -775,25 +897,41 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 
 			// Extract value - try both Float64 and Int64 types
 			value := float64(0)
-
-			valueCol := r.Column(valueColIdx)
-			if floatCol, ok := valueCol.(*array.Float64); ok {
-				value = floatCol.Value(int(i))
-			} else if intCol, ok := valueCol.(*array.Int64); ok {
-				value = float64(intCol.Value(int(i)))
+			if valueColIdx >= 0 {
+				valueCol := r.Column(valueColIdx)
+				if floatCol, ok := valueCol.(*array.Float64); ok {
+					value = floatCol.Value(int(i))
+				} else if intCol, ok := valueCol.(*array.Int64); ok {
+					value = float64(intCol.Value(int(i)))
+				}
 			}
 
-			// Extract labels
+			// Start building labels map
 			labels := make(map[string]string)
-			if labelsColIdx >= 0 && labelsColIdx < int(r.NumCols()) {
+
+			// Add trace name from example_type as __name__ label
+			if exampleTypeColIdx >= 0 {
+				if exampleType := extractStringValue(r.Column(exampleTypeColIdx), int(i)); exampleType != "" {
+					labels["__name__"] = exampleType
+				}
+			}
+
+			// Extract other labels from the labels map
+			if labelsColIdx >= 0 {
 				if labelsDict, ok := r.Column(labelsColIdx).(*array.Dictionary); ok {
 					keyIndex := labelsDict.GetValueIndex(int(i))
 					if keyIndex >= 0 {
 						dictValues := labelsDict.Dictionary().(*array.String)
 						labelStr := dictValues.Value(keyIndex)
-						if err := json.Unmarshal([]byte(labelStr), &labels); err != nil {
-							// Just create an empty label if we can't parse
-							labels = make(map[string]string)
+						// Parse extra labels if available
+						var extraLabels map[string]string
+						if err := json.Unmarshal([]byte(labelStr), &extraLabels); err != nil {
+							log.Printf("DEBUG: Error parsing labels JSON: %v", err)
+						} else {
+							// Merge extra labels into our labels map
+							for k, v := range extraLabels {
+								labels[k] = v
+							}
 						}
 					}
 				}
@@ -806,14 +944,23 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 				Labels:    labels,
 			}
 			dataPoints = append(dataPoints, dataPoint)
+
+			// Log a sample of data points (first few only)
+			if i < 3 {
+				log.Printf("DEBUG: Retrieved data point - time: %s, value: %f, labels: %v",
+					timestamp.Format(time.RFC3339), value, labels)
+			}
 		}
 		return nil
 	})
 
 	if err != nil {
+		log.Printf("DEBUG: Query execution error: %v", err)
 		// Return empty result instead of error
 		return []*DataPoint{}, nil
 	}
+
+	log.Printf("DEBUG: Query returned %d data points", len(dataPoints))
 
 	// Apply additional filtering in memory if needed
 	if metricQuery.LabelFilter != nil {
@@ -824,7 +971,25 @@ func (s *FrostDBStore) QueryTraces(metricQuery *MetricQuery) ([]*DataPoint, erro
 			}
 		}
 		dataPoints = filteredPoints
+		log.Printf("DEBUG: After label filtering: %d data points", len(dataPoints))
 	}
 
 	return dataPoints, nil
+}
+
+// Close closes the FrostDB database
+func (s *FrostDBStore) Close() error {
+	// Stop the flush ticker
+	if s.flushTicker != nil {
+		s.flushTicker.Stop()
+		close(s.shutdown)
+	}
+
+	// Flush any remaining data
+	s.FlushBatch()
+
+	if s.columnstore != nil {
+		return s.columnstore.Close()
+	}
+	return nil
 }
